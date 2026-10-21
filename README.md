@@ -2,17 +2,25 @@
 
 Live P1 energy monitoring, phase by phase.
 
-A Linux desktop dashboard for a HomeWizard P1 meter, written in C++20 with Dear ImGui and ImPlot. It discovers the meter using Avahi, reads its local HTTP API, and plots total grid power and power per phase.
+A Linux energy monitor for a HomeWizard P1 meter, with a C++20 desktop dashboard using Dear ImGui and ImPlot and a headless web dashboard for a server or Raspberry Pi. It discovers the meter using Avahi, reads its local HTTP API, and plots total grid power and power per phase. An optional Philips Hue bridge interface reads room temperature sensors and displays their readings alongside gas usage in a combined plot.
 
 A simulation mode lets you use the dashboard without a meter or network connection.
 
+![P1Scope dashboard with electricity, gas usage, room temperatures, and phase groups](docs/dashboard.png)
+
+*Dashboard example with simulated readings and 30 minutes of generated history; the plots show the selected 10-minute window.*
+
 ## Features
 
+- Headless LAN server: view the dashboard from Windows, Android, or any modern browser.
 - Live grid import/export and the meter's active tariff.
 - Separate power curves for Grid (yellow), L1 (blue), L2 (orange), and L3 (green).
 - Phase cards showing power, voltage, and measured current relative to 25 A.
-- Selectable 1-, 5-, and 10-minute views, with automatic Y-axis scaling.
+- Selectable 1-, 5-, 10-, and 30-minute views plus a 1-hour view, with automatic Y-axis scaling.
 - Crosshairs and a shared tooltip showing the nearest sample's time and all four power values.
+- Optional gas usage plot in m³, with the total gas meter reading and its reported timestamp.
+- Philips Hue room temperatures alongside gas usage, with a separate °C axis, matching readout colors, and hover details.
+- Hue bridge pairing through `hue_temperatures.py --pair`, background polling every 30 seconds, and connection status.
 - Optional dashed reference lines at ±5,750 W per phase.
 - Meter Wi-Fi name, signal strength, and connection status.
 - Stale-data indication and gaps for failed requests or measurement intervals longer than three seconds.
@@ -22,6 +30,10 @@ A simulation mode lets you use the dashboard without a meter or network connecti
 ## Requirements
 
 ### Software
+
+The requirements below include the desktop UI. For a headless server build, use
+the smaller dependency list in [Run on a network server](#run-on-a-network-server).
+
 
 - Linux with an X11 display, or XWayland in a Wayland session. The application explicitly selects GLFW's X11 backend.
 - A C++20 compiler and standard library supporting `std::osyncstream`.
@@ -107,7 +119,7 @@ Print the simulated JSON reports as well:
 
 | Option | Short form | Description |
 | --- | --- | --- |
-| `--simulation` | `-s` | Generate local P1 reports without Avahi discovery or HTTP requests. |
+| `--simulation` / `--simulated` | `-s` | Generate local P1 reports without Avahi discovery or HTTP requests. |
 | `--report` | `-v` | Print each successful live or simulated JSON report to stdout. |
 | `--config PATH` | | Load group assignments from another JSON file. |
 | `--help` | `-h` | Show usage and examples. |
@@ -122,9 +134,115 @@ Options can be combined in any order. Use separate short options (`-s -v`); comb
 
 Rebuild after modifying the source; changes to help text and behavior do not appear in an older executable.
 
+## Run on a network server
+
+The `p1scope-server` target runs without X11, Wayland, GLFW, OpenGL, or the
+ImGui/ImPlot checkouts. It collects readings centrally and serves the dashboard
+and a JSON API over HTTP. Windows and Android devices only need a browser; the
+server itself currently runs on Linux, including Raspberry Pi OS.
+
+### Build on the server
+
+Copy the project to the server first, then build there so the executable matches
+its CPU architecture. For example, use `/opt/p1scope` if installing the systemd
+service below. Install the headless dependencies (Debian/Ubuntu package names):
+
+```bash
+sudo apt install build-essential cmake pkg-config \
+    libcurl4-openssl-dev nlohmann-json3-dev libavahi-client-dev avahi-daemon
+cmake -S . -B build-server -DP1SCOPE_BUILD_DESKTOP=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build build-server --parallel 2
+```
+
+CMake 4.3 or newer is still required by this project's `CMakeLists.txt`; select a
+compatible CMake installation if your distribution's package is older. No Node.js,
+npm, Python, or internet connection is required to run the dashboard. D3 7.9.0 is
+bundled in `web/vendor` with its license. Python is only needed for initial Hue
+pairing and the optional integration check.
+
+### Start and connect
+
+Try simulation first:
+
+```bash
+./build-server/p1scope-server --simulation --bind 0.0.0.0 --port 8080
+```
+
+On another device on the same network, open `http://SERVER-IP:8080` (replace
+`SERVER-IP` with the server's LAN IP address). For actual meter readings, omit
+`--simulation`:
+
+```bash
+./build-server/p1scope-server --bind 0.0.0.0 --port 8080
+```
+
+The default bind address is `127.0.0.1`, which only permits access from the server
+itself. `--bind 0.0.0.0` enables access through all IPv4 interfaces. Allow TCP port
+8080 through the server's firewall for your LAN if necessary. This HTTP dashboard
+has no login and is intended for a trusted local network; do not port-forward it
+to the internet.
+
+The desktop executable also supports `./build/p1scope --server` with the same
+options, but `p1scope-server` avoids desktop dependencies entirely. Stop the server
+with Ctrl+C or SIGTERM. The desktop default remains a graphical application.
+
+Keep `groups.json`, `.hue-credentials.json` (if using Hue), and `web/` available
+at their source-directory locations. Edit groups on the server and click
+**Reload groups** in the browser. The `--config /path/to/groups.json` option can
+select another group file; `--web-root /path/to/web` can select another assets
+directory. The HTTP server serves only its listed web assets and API routes,
+never the source directory or credentials file.
+
+For Hue, copy your existing `.hue-credentials.json` securely to the server's
+project directory or run `python3 hue_temperatures.py --pair` there. The account
+running the server must own and be able to read this file; keep its permissions
+at `600`. Restart after changing Hue credentials. Without Hue, the gas and
+electricity views continue to work and the dashboard shows the Hue status.
+
+The server needs local network discovery access to the P1 meter through Avahi,
+and HTTPS access to the paired Hue bridge. Separate VLANs may require mDNS
+forwarding. The existing three-phase meter requirement also applies to server mode.
+
+The browser refreshes data every two seconds; P1 polling remains approximately
+once per second and Hue polling every 30 seconds. One hour of history lives in
+the server's memory, shared by all clients. Reloading a browser keeps that history;
+restarting the server clears it and the gas-session baseline. Browser view options
+are remembered locally. Connection failures are marked stale or unavailable.
+
+### Start automatically with systemd
+
+An example service is provided in `deploy/p1scope.service`. It assumes the project
+and its headless build are in `/opt/p1scope`, and runs as the `p1scope` user.
+After placing the project there and building as above:
+
+```bash
+sudo useradd --system --home-dir /opt/p1scope --shell /usr/sbin/nologin p1scope
+sudo chown -R p1scope:p1scope /opt/p1scope
+# If Hue credentials are present:
+sudo chmod 600 /opt/p1scope/.hue-credentials.json
+sudo cp /opt/p1scope/deploy/p1scope.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now p1scope
+```
+
+Skip `useradd` if that account already exists and the `chmod` command if not using
+Hue. Review the service's paths and port before installing it. Read its logs with
+`journalctl -u p1scope -f`. The service starts in live mode and restarts on failure;
+add `--simulation` to `ExecStart` only if you want simulated readings.
+
+### Verify the headless server
+
+```bash
+python3 tests/server_smoke.py build-server/p1scope-server
+```
+
+This starts a temporary localhost server in simulation mode and checks readings,
+Hue simulation, assets, group reloads, blocked credential paths, and shutdown.
+It does not require real devices or a graphical display.
+
 ## Dashboard controls
 
-- **History:** choose 1, 5, or 10 minutes. Up to ten minutes of data are retained in memory, so switching views does not discard the other samples.
+- **History:** choose 1, 5, 10, or 30 minutes, or 1 hour. Up to one hour of data is retained in memory, so switching views does not discard the other samples.
 - **25 A reference:** show or hide the ±5,750 W reference lines (off by default). Hiding them allows the Y-axis to zoom in on smaller variations.
 - **Hover:** move over the plot to see the nearest sample's timestamp and power values. Missing-data intervals are identified rather than interpolated in the tooltip.
 - **Legend:** click a series' color icon to toggle its curve. Right-click the plot and open **Legend** to change its position or orientation. The default is the top-right corner.
@@ -139,18 +257,49 @@ The current bars use the magnitude of measured phase current, not an estimate ca
 ## Circuit groups per phase
 
 Edit `groups.json` to describe which circuit groups are connected to each phase.
-The seven initial entries are unassigned because the actual wiring is unknown.
-For example, replace an entry with:
+The file contains a JSON object with a `groups` array. Each entry describes one
+circuit group in your distribution board. For example, a complete seven-group
+configuration could look like this:
 
 ```json
-{ "number": 1, "name": "Keuken", "phase": 2 }
+{
+  "groups": [
+    { "number": 1, "name": "Woonkamer, Magnetron", "phase": 1 },
+    { "number": 2, "name": "Hal, C.V.", "phase": 1 },
+    { "number": 3, "name": "Slaapkamers, Airco, IR paneel", "phase": 2 },
+    { "number": 4, "name": "Oven", "phase": 2 },
+    { "number": 5, "name": "Wasmachine, Vaatwasser", "phase": 3 },
+    { "number": 6, "name": "Droger", "phase": 3 },
+    { "number": 7, "name": "Tuin, Heater", "phase": 3 }
+  ]
+}
 ```
 
-`phase` accepts `1`, `2`, `3`, or `null` for an unknown assignment. Group numbers
-must be positive and unique; names must contain text. You may add or remove groups.
-Assigned groups appear in the matching phase card, using the same phase colors as
-the graph. Unassigned groups appear above the graph. This is a wiring overview;
-the P1 meter measures power per phase, so it does not provide individual group readings.
+| Field | Meaning | Accepted values |
+| --- | --- | --- |
+| `number` | Circuit group number on the distribution board. | A positive integer, unique within the file. |
+| `name` | Description shown on the phase card, such as rooms or appliances. | A nonempty string; a comma can separate multiple descriptions. |
+| `phase` | Electrical phase connected to the group. | `1` for L1, `2` for L2, `3` for L3, or `null` if unknown. |
+
+In this example, L1 shows groups 1 and 2; L2 shows groups 3 and 4; L3 shows groups
+5, 6, and 7. Replace the names and assignments with your actual wiring. You may
+add or remove entries; the application does not require exactly seven groups.
+
+If a group's phase is not yet known, use `null` without quotes:
+
+```json
+{ "number": 7, "name": "Tuin, Heater", "phase": null }
+```
+
+Assigned groups appear in the matching phase card. All three cards keep the same
+height, sized to fit the largest group list and wrapped descriptions. Unassigned
+groups appear above the graph. This is a wiring overview; the P1 meter measures
+power per phase, so it does not provide individual group readings. Changing the
+file only changes the displayed description and assignment.
+
+Keep valid JSON syntax: use double quotes for field names and descriptions,
+separate entries with commas, and omit the comma after the last entry. Comments
+are not supported.
 
 The default configuration is `groups.json` in the source directory, independent of
 the working directory. You can select another file with
@@ -159,9 +308,74 @@ no rebuild or restart is needed. An invalid configuration displays an error and
 keeps the last successfully loaded assignments. On initial failure, the dashboard
 continues without assignments.
 
+## Gas usage
+
+The **Gas & temperatures** checkbox shows a combined plot below electricity, using the same
+history selection. It plots the increase in `total_gas_m3` since the first available
+reading in the visible window, in m³. Changing the window or scrolling history
+changes that baseline. This is observed usage within the retained history, not a
+billing total or an instantaneous m³/h rate. The total meter reading and formatted
+`gas_timestamp` (for example, October 21, 2026 19:10:00) appear above the plot.
+
+**Gas used since startup** shows the difference between the first valid gas reading
+received during this run and the latest valid reading. Its baseline is independent
+of the plot window and retained history, and resets when the program restarts.
+Gas readings arrive about every five minutes; consumption since the latest meter
+update is not yet included. Because the initial reading can predate startup, this
+is a difference between received meter readings rather than an exact measurement
+from the instant the program launched. A decreased meter reading makes the session
+total unavailable until restart.
+
+Gas updates can arrive less frequently than electricity; the staircase shows values
+at the time the application receives them, rather than reconstructing consumption
+between meter updates. Missing readings and connection outages leave gaps. Gas is
+optional: electricity continues when gas fields are absent. A decrease in the meter
+reading suppresses the remaining usage curve in that window and displays a warning.
+Simulation reports gas every five minutes using a shared heating model: the
+living room starts at 18 °C and warms gradually to 21 °C over one hour. It then
+cools to 20.5 °C in ten minutes with the burner off and reheats to 21 °C in ten
+minutes. This thermostat cycle repeats. Gas increases at 0.9 m³/hour only during heating.
+The hall and bathroom follow the same cycle at lower temperatures. Gas updates
+can include heating from earlier in the reporting interval; the trendline may
+remain positive while the burner is off because it fits the visible history.
+This model applies only to simulation; live readings are displayed as reported.
+
+The **Gas trend** checkbox (on by default) overlays a linear least-squares fit of
+valid gas readings in the visible window. Its estimated slope in m³/hour appears
+in the hover tooltip. Missing-data intervals remain gaps in the trendline. The fit
+needs at least two readings at different times. Since gas updates roughly every
+five minutes, short windows can show a flat or unrepresentative trend; this is an
+estimate over received readings, not instantaneous gas flow.
+
+## Hue temperatures in the gas plot
+
+Room temperature curves share the gas plot's time axis and history selection.
+Gas uses the left axis (m³); temperature uses the right axis (°C). Current sensor
+readings and Hue connection status appear above the plot. Use the legend to toggle
+individual series. Hover over the combined plot for the cursor time, gas usage,
+total gas meter reading, and each sensor's nearest temperature and sample time.
+Missing readings and times outside a series' history are marked unavailable.
+Temperature history is collected during this run and retained
+for one hour; readings are timestamped when received.
+
+The application connects to the bridge address saved during pairing; it does not
+perform Hue mDNS discovery at each startup. A successful connection is reported
+in the dashboard and timestamped stderr logs with the bridge IP and number of
+temperature sensors found. Logs also list sensor names and report failures and
+recovery when the connection status changes. API keys are never logged.
+
+The application reads `.hue-credentials.json` from the source directory and polls
+the bridge every 30 seconds in a background thread. Pair initially with
+`python3 hue_temperatures.py --pair`. Credentials are saved with owner-only
+permissions and excluded from Git. Restart P1Scope after changing credentials.
+Local bridge HTTPS uses the same certificate handling as the pairing script
+(the bridge's self-signed certificate is not verified). Failed requests and invalid
+sensor readings create gaps and an unavailable status; electricity and gas keep
+working. Simulation generates three temperature curves without contacting Hue.
+
 ## Simulation
 
-Simulation generates a report approximately every second and feeds it through the same measurement and display path as live data. The window title and connection status explicitly identify simulated data.
+Simulation generates a report approximately every second and feeds it through the same measurement and display path as live data. The window title and connection status explicitly identify simulated data. Gas readouts, plot legends, and trend tooltip values also include `(simulated)`.
 
 Generated phase powers follow offset sine waves with random noise. Voltage varies between 227 and 233 V, Wi-Fi strength varies between 75 and 100%, and total power equals the sum of the three phases. Simulated currents assume power factor 1. This is demonstration data, not a model of a specific appliance.
 
@@ -211,7 +425,11 @@ Confirm the CMake and GLFW minimum versions above. If CMake fails with a Snap/Ap
 | `main.cpp` | Command-line options, HTTP polling, simulation, measurements, and dashboard. |
 | `HomeWizardDiscovery.hxx` / `.cxx` | Avahi discovery and cancellation. |
 | `Logging.hxx` | Thread-safe stderr messages with local timestamps. |
-| `CMakeLists.txt` | Build configuration and dependencies. |
+| `CMakeLists.txt` | Desktop and headless server builds. |
+| `HttpServer.hxx` / `.cxx` | LAN HTTP server, static assets, and API routing. |
+| `web/` | Responsive web dashboard and bundled D3 chart library. |
+| `deploy/p1scope.service` | Example systemd service for a Linux server. |
+| `tests/server_smoke.py` | Headless HTTP integration checks. |
 | `P1.json` | Example meter response. |
 | `external/imgui` | Dear ImGui sources and GLFW/OpenGL backends. |
 | `external/implot` | ImPlot sources. |

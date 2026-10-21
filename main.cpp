@@ -1,13 +1,19 @@
 #include "HomeWizardDiscovery.hxx"
+#include "HttpServer.hxx"
+#include <csignal>
+#include "HueTemperatures.hxx"
+#include "HeatingSimulation.hxx"
 #include "Logging.hxx"
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
+#ifndef P1SCOPE_HEADLESS
 #include <GLFW/glfw3.h>
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
 #include "implot.h"
+#endif
 #include <algorithm>
 #include <cmath>
 #include <atomic>
@@ -88,12 +94,13 @@ struct Sample {
     double active_power_w;
     double active_power_l_w[3];
     bool breakBefore = false;
+    double totalGasM3 = NAN;
 };
 
 static std::deque<Sample> samples;
 static std::mutex samplesMutex;
 static std::atomic<bool> running{true};
-constexpr double HISTORY_SECONDS = 600.0;
+constexpr double HISTORY_SECONDS = 3600.0;
 constexpr double MAIN_FUSE_CURRENT_A = 25.0;
 constexpr double NOMINAL_PHASE_VOLTAGE_V = 230.0;
 // Per-phase active-power reference at unity power factor, not a fuse trip threshold.
@@ -105,6 +112,8 @@ namespace {
         bool requestFailed = false;
         double active_power_w = 0.0;
         double active_power_l_w[3]{};
+        double totalGasM3 = NAN;
+        std::string gasTimestamp;
         double voltage[3]{};
         double current[3] = {NAN, NAN, NAN};
         std::string activeTariff = "unavailable";
@@ -116,6 +125,48 @@ namespace {
 
 static Measurement measurement;
 static double firstSampleTime = 0.0;
+static std::chrono::system_clock::time_point programStarted;
+
+struct GasSession {
+    double firstTotal = NAN;
+    double latestTotal = NAN;
+    bool meterDecreased = false;
+
+    void update(double total) {
+        if (!std::isfinite(total) || total < 0.0)
+            return;
+        if (!std::isfinite(firstTotal))
+            firstTotal = total;
+        if (std::isfinite(latestTotal) && total < latestTotal)
+            meterDecreased = true;
+        latestTotal = total;
+    }
+};
+
+// Protected by samplesMutex; independent of the rolling plot history.
+static GasSession gasSession;
+
+static std::string formatGasTimestamp(const std::string &timestamp) {
+    if (timestamp.size() != 12 ||
+        timestamp.find_first_not_of("0123456789") != std::string::npos)
+        return "unavailable";
+    const int year = 2000 + std::stoi(timestamp.substr(0, 2));
+    const unsigned month = std::stoi(timestamp.substr(2, 2));
+    const unsigned day = std::stoi(timestamp.substr(4, 2));
+    const int hour = std::stoi(timestamp.substr(6, 2));
+    const int minute = std::stoi(timestamp.substr(8, 2));
+    const int second = std::stoi(timestamp.substr(10, 2));
+    const std::chrono::year_month_day date{std::chrono::year{year},
+        std::chrono::month{month}, std::chrono::day{day}};
+    if (!date.ok() || hour > 23 || minute > 59 || second > 59)
+        return "unavailable";
+    static constexpr const char *months[] = {"January", "February", "March", "April",
+        "May", "June", "July", "August", "September", "October", "November", "December"};
+    char formatted[64];
+    std::snprintf(formatted, sizeof(formatted), "%s %u, %d %02d:%02d:%02d",
+        months[month - 1], day, year, hour, minute, second);
+    return formatted;
+}
 
 static double plotTime() {
     // Display civil time, including time spent suspended and clock corrections.
@@ -134,9 +185,10 @@ static void publishMeasurement(const Measurement &next) {
     const bool breakBefore = measurement.requestFailed ||
         (measurement.valid && std::chrono::duration<double>(next.updated - measurement.updated).count() > 3.0);
     measurement = next;
+    gasSession.update(next.totalGasM3);
     samples.push_back({timestamp, next.active_power_w,
         {next.active_power_l_w[0], next.active_power_l_w[1], next.active_power_l_w[2]},
-        breakBefore});
+        breakBefore, next.totalGasM3});
     while (!samples.empty() && samples.front().time < timestamp - HISTORY_SECONDS)
         samples.pop_front();
 }
@@ -259,6 +311,17 @@ static json simulatedP1(std::mt19937 &random, size_t tick) {
         report["active_current_" + suffix + "_a"] = watts / volts;
         total += watts;
     }
+    // Publish heating-only consumption every five minutes, like a gas meter.
+    const double elapsed = HeatingSimulation::elapsed();
+    const double reportedSeconds = std::floor(elapsed / 300.0) * 300.0;
+    report["total_gas_m3"] = HeatingSimulation::gasTotal(reportedSeconds);
+    const std::time_t gasTime = std::chrono::system_clock::to_time_t(
+        HeatingSimulation::started + std::chrono::seconds(static_cast<long long>(reportedSeconds)));
+    std::tm gasLocal{};
+    localtime_r(&gasTime, &gasLocal);
+    char gasTimestamp[16];
+    std::strftime(gasTimestamp, sizeof(gasTimestamp), "%y%m%d%H%M%S", &gasLocal);
+    report["gas_timestamp"] = std::stoll(gasTimestamp);
     report["active_power_w"] = total;
     return report;
 }
@@ -354,6 +417,14 @@ static void p1Thread() {
             if (value != j.end() && value->is_number())
                 next.current[phase] = value->get<double>();
         }
+        if (const auto gas = j.find("total_gas_m3"); gas != j.end() && gas->is_number()) {
+            const double value = gas->get<double>();
+            if (std::isfinite(value) && value >= 0.0)
+                next.totalGasM3 = value;
+        }
+        if (const auto timestamp = j.find("gas_timestamp");
+            timestamp != j.end() && timestamp->is_number_integer())
+            next.gasTimestamp = formatGasTimestamp(timestamp->dump());
         next.updated = std::chrono::system_clock::now();
         publishMeasurement(next);
 
@@ -367,6 +438,7 @@ static void p1Thread() {
         curl_easy_cleanup(curl);
 }
 
+#ifndef P1SCOPE_HEADLESS
 static double powerScale(const double power) {
     double p = std::abs(power);
     p *= 1.25; // Add some headroom
@@ -386,6 +458,8 @@ static int timeFormatter(const double value, char *buff, const int size, void *)
         tm.tm_sec);
 }
 
+#endif
+
 static void printHelp(const string& programName) {
     string help = R"(
 P1Scope - Live P1 Energy Monitor
@@ -394,8 +468,12 @@ USAGE: _progname [OPTIONS]
 
 OPTIONS:
     --report, -v   : Print each live or simulated P1 JSON report
-    --simulation, -s : Generate random P1 reports once per second;
+    --simulation, --simulated, -s : Generate random P1 reports once per second;
                     no meter, Avahi discovery or HTTP connection required
+    --server      : Serve the web dashboard without a graphical window
+    --bind ADDRESS : HTTP IPv4 bind address (default: 127.0.0.1)
+    --port PORT   : HTTP port (default: 8080)
+    --web-root PATH : Directory containing the web dashboard assets
     --config PATH : Load circuit groups from a JSON file
     --help, -h    : Show this help
 
@@ -409,7 +487,9 @@ Options can be combined in any order.
          << "    " << programName << " --simulation --report\n\n";
 }
 
-static void drawDashboard() {
+#ifndef P1SCOPE_HEADLESS
+static void drawDashboard(const HueSnapshot &hue) {
+    const char *gasSuffix = simulation ? " (simulated)" : "";
     static bool showReference = false;
     const char *seriesNames[] = {"Grid", "L1", "L2", "L3"};
     const ImVec4 seriesColors[] = {
@@ -430,13 +510,16 @@ static void drawDashboard() {
 
     // Copy readings and history together to render one consistent snapshot.
     Measurement displayed;
+    GasSession displayedGasSession;
     const double now = plotTime();
     double first;
     std::vector<double> x;
+    std::vector<double> gasTotals;
     std::vector<double> y[4]; // Grid total, L1, L2, L3
     {
         std::lock_guard<std::mutex> lock(samplesMutex);
         displayed = measurement;
+        displayedGasSession = gasSession;
         first = firstSampleTime;
         while (!samples.empty() && samples.front().time < now - HISTORY_SECONDS)
             samples.pop_front();
@@ -446,10 +529,12 @@ static void drawDashboard() {
         for (const auto &s: samples) {
             if (s.breakBefore && !x.empty()) {
                 x.push_back((x.back() + s.time) * 0.5);
+                gasTotals.push_back(NAN);
                 for (auto &series : y)
                     series.push_back(std::numeric_limits<double>::quiet_NaN());
             }
             x.push_back(s.time);
+            gasTotals.push_back(s.totalGasM3);
             y[0].push_back(s.active_power_w);
             for (size_t phase = 0; phase < 3; ++phase)
                 y[phase + 1].push_back(s.active_power_l_w[phase]);
@@ -464,7 +549,7 @@ static void drawDashboard() {
         ImGui::TableSetupColumn("Connection", ImGuiTableColumnFlags_WidthStretch, 1.0f);
         ImGui::TableNextColumn();
         if (displayed.valid) {
-            ImGui::Text("Grid %s: %.0f W", displayed.active_power_w >= 0 ? "import" : "export",
+            ImGui::TextColored(seriesColors[0], "Grid %s: %.0f W", displayed.active_power_w >= 0 ? "import" : "export",
                         std::abs(displayed.active_power_w));
             ImGui::TextWrapped("Tariff: %s", displayed.activeTariff.c_str());
         } else {
@@ -499,11 +584,11 @@ static void drawDashboard() {
             ImGui::TextWrapped("Unassigned: %d - %s", group.number, group.name.c_str());
     }
     static int timeRange = 2;
-    const double durations[] = {60.0, 300.0, 600.0};
+    const double durations[] = {60.0, 300.0, 600.0, 1800.0, 3600.0};
     ImGui::TextUnformatted("History");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(110.0f);
-    ImGui::Combo("##History", &timeRange, "1 minute\0" "5 minutes\0" "10 minutes\0");
+    ImGui::Combo("##History", &timeRange, "1 minute\0" "5 minutes\0" "10 minutes\0" "30 minutes\0" "1 hour\0");
     ImGui::SameLine();
     ImGui::Checkbox("25 A reference", &showReference);
     if (ImGui::IsItemHovered())
@@ -541,7 +626,19 @@ static void drawDashboard() {
     }
     const float cardHeight = *std::max_element(std::begin(cardHeights), std::end(cardHeights));
     cardsHeight = (stackedCards ? 3.0f : 1.0f) * (cardHeight + style.ItemSpacing.y);
-    const ImVec2 plotSize(-1, std::max(160.0f, ImGui::GetContentRegionAvail().y - cardsHeight));
+    static bool showGas = true;
+    ImGui::Checkbox("Gas & temperatures", &showGas);
+    static bool showGasTrend = true;
+    if (showGas) {
+        ImGui::SameLine();
+        ImGui::Checkbox(simulation ? "Gas trend (simulated)" : "Gas trend", &showGasTrend);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Linear fit of received gas readings in the visible window.\nEstimated average trend, not instantaneous flow; gas updates about every 5 minutes.");
+    }
+    const float availablePlotHeight = ImGui::GetContentRegionAvail().y - cardsHeight;
+    const float gasPlotHeight = showGas ? std::max(200.0f, availablePlotHeight * 0.4f) : 0.0f;
+    const ImVec2 plotSize(-1, std::max(160.0f, availablePlotHeight -
+        (showGas ? gasPlotHeight + style.ItemSpacing.y + 4.0f * ImGui::GetTextLineHeightWithSpacing() : 0.0f)));
 
     double peakPower = showReference ? PHASE_POWER_REFERENCE_W : 0.0;
     for (const auto &series : y)
@@ -627,6 +724,228 @@ static void drawDashboard() {
 
         ImPlot::EndPlot();
     }
+    if (showGas) {
+        if (std::isfinite(displayed.totalGasM3))
+            ImGui::TextWrapped("Gas meter%s: %.3f m3 | Updated: %s%s",
+                gasSuffix, displayed.totalGasM3, displayed.gasTimestamp.empty() ? "unavailable" : displayed.gasTimestamp.c_str(),
+                stale ? " | stale connection" : "");
+        else
+            ImGui::TextDisabled("Gas%s: reading unavailable", gasSuffix);
+        const auto elapsedSeconds = std::max(0LL, static_cast<long long>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now() - programStarted).count()));
+        char sessionDuration[64];
+        std::snprintf(sessionDuration, sizeof(sessionDuration), "%lldh %02lldm %02llds",
+            elapsedSeconds / 3600, (elapsedSeconds / 60) % 60, elapsedSeconds % 60);
+        if (displayedGasSession.meterDecreased)
+            ImGui::TextWrapped("Gas used since startup%s (%s): unavailable (meter reading decreased)", gasSuffix, sessionDuration);
+        else if (std::isfinite(displayedGasSession.firstTotal))
+            ImGui::TextWrapped("Gas used since startup%s (%s): %.3f m3 (first to latest received reading)",
+                gasSuffix, sessionDuration, displayedGasSession.latestTotal - displayedGasSession.firstTotal);
+        else
+            ImGui::TextDisabled("Gas used since startup%s (%s): waiting for first gas reading", gasSuffix, sessionDuration);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Gas readings arrive about every 5 minutes.\nUsage is relative to the first gas reading received this session;\nconsumption after the latest meter update is not included yet.");
+        ImGui::TextWrapped("%s", hue.status.c_str());
+        const ImVec4 temperatureColors[] = {
+            ImVec4(1.0f, 0.55f, 0.15f, 1.0f), ImVec4(0.2f, 0.8f, 0.9f, 1.0f),
+            ImVec4(0.4f, 0.9f, 0.4f, 1.0f), ImVec4(1.0f, 0.4f, 0.6f, 1.0f)};
+        const float readoutRight = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
+        for (size_t i = 0; i < hue.sensors.size(); ++i) {
+            const auto &sensor = hue.sensors[i];
+            std::string readout = sensor.name + ": ";
+            if (!sensor.history.empty() && std::isfinite(sensor.history.back().celsius)) {
+                char reading[32];
+                std::snprintf(reading, sizeof(reading), "%.2f C", sensor.history.back().celsius);
+                readout += reading;
+            } else {
+                readout += "unavailable";
+            }
+            if (i > 0 && ImGui::GetItemRectMax().x + ImGui::GetStyle().ItemSpacing.x +
+                ImGui::CalcTextSize(readout.c_str()).x <= readoutRight)
+                ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Text, temperatureColors[i % 4]);
+            ImGui::TextWrapped("%s", readout.c_str());
+            ImGui::PopStyleColor();
+        }
+        std::vector<double> gasUsage(x.size(), NAN);
+        double baseline = NAN;
+        double lastTotal = NAN;
+        double peakGas = 0.001;
+        bool reset = false;
+        for (size_t i = 0; i < x.size(); ++i) {
+            if (x[i] < xmin || x[i] > xmax || !std::isfinite(gasTotals[i]))
+                continue;
+            if (!std::isfinite(baseline))
+                baseline = gasTotals[i];
+            if (std::isfinite(lastTotal) && gasTotals[i] < lastTotal)
+                reset = true; // Do not report negative usage after a meter reset/replacement.
+            lastTotal = gasTotals[i];
+            if (!reset) {
+                gasUsage[i] = gasTotals[i] - baseline;
+                peakGas = std::max(peakGas, gasUsage[i]);
+            }
+        }
+        // Center the regression times to avoid loss of precision with epoch timestamps.
+        std::vector<double> gasTrend(x.size(), NAN);
+        double trendRate = NAN;
+        double sumTime = 0.0, sumUsage = 0.0;
+        size_t trendCount = 0;
+        if (showGasTrend) {
+            for (size_t i = 0; i < x.size(); ++i) {
+                if (!std::isfinite(gasUsage[i])) continue;
+                sumTime += x[i] - xmin;
+                sumUsage += gasUsage[i];
+                ++trendCount;
+            }
+            if (trendCount >= 2) {
+                const double meanTime = sumTime / trendCount;
+                const double meanUsage = sumUsage / trendCount;
+                double covariance = 0.0, variance = 0.0;
+                for (size_t i = 0; i < x.size(); ++i) {
+                    if (!std::isfinite(gasUsage[i])) continue;
+                    const double delta = (x[i] - xmin) - meanTime;
+                    covariance += delta * (gasUsage[i] - meanUsage);
+                    variance += delta * delta;
+                }
+                if (variance > 0.0) {
+                    const double slope = covariance / variance;
+                    trendRate = slope * 3600.0;
+                    for (size_t i = 0; i < x.size(); ++i) {
+                        if (!std::isfinite(gasUsage[i])) continue;
+                        gasTrend[i] = meanUsage + slope * ((x[i] - xmin) - meanTime);
+                        peakGas = std::max(peakGas, gasTrend[i]);
+                    }
+                }
+            }
+        }
+        if (ImPlot::BeginPlot("Gas usage & room temperatures", ImVec2(-1, gasPlotHeight), ImPlotFlags_Crosshairs | ImPlotFlags_NoMouseText)) {
+            ImPlot::SetupLegend(ImPlotLocation_NorthEast);
+            ImPlot::SetupAxis(ImAxis_X1, "Time (received)");
+            ImPlot::SetupAxis(ImAxis_Y1, "Gas [m3]");
+            ImPlot::SetupAxis(ImAxis_Y2, "Temperature [C]", ImPlotAxisFlags_Opposite);
+            ImPlot::SetupAxisFormat(ImAxis_Y2, "%.1f");
+            double minTemp = 15.0, maxTemp = 25.0;
+            for (const auto &sensor : hue.sensors)
+                for (const auto &point : sensor.history)
+                    if (point.time >= xmin && point.time <= xmax && std::isfinite(point.celsius)) {
+                        minTemp = std::min(minTemp, point.celsius - 1.0);
+                        maxTemp = std::max(maxTemp, point.celsius + 1.0);
+                    }
+            ImPlot::SetupAxisLimits(ImAxis_Y2, minTemp, maxTemp, ImGuiCond_Always);
+            ImPlot::SetupAxisFormat(ImAxis_X1, timeFormatter);
+            ImPlot::SetupAxisFormat(ImAxis_Y1, "%.3f");
+            ImPlot::SetupAxisLimits(ImAxis_X1, xmin, xmax, ImGuiCond_Always);
+            ImPlot::SetupAxisLimits(ImAxis_Y1, 0.0, peakGas * 1.15, ImGuiCond_Always);
+            if (!x.empty()) {
+                ImPlotSpec gasStyle;
+                gasStyle.LineColor = ImVec4(0.75f, 0.5f, 1.0f, 1.0f);
+                ImPlot::PlotStairs(simulation ? "Gas (simulated)" : "Gas", x.data(), gasUsage.data(), static_cast<int>(x.size()), gasStyle);
+                if (showGasTrend && std::isfinite(trendRate)) {
+                    ImPlotSpec trendStyle;
+                    trendStyle.LineColor = ImVec4(1.0f, 0.85f, 0.3f, 1.0f);
+                    trendStyle.Marker = ImPlotMarker_Circle;
+                    trendStyle.MarkerSize = 1.5f;
+                    trendStyle.MarkerFillColor = trendStyle.LineColor;
+                    trendStyle.MarkerLineColor = trendStyle.LineColor;
+                    std::vector<double> dotTimes, dotValues;
+                    const float width = ImPlot::GetPlotSize().x;
+                    // Space dots in pixels so the pattern stays consistent at every history scale.
+                    for (float pixel = 0.0f; pixel < width; pixel += 6.0f) {
+                        const double time = xmin + (xmax - xmin) * pixel / width;
+                        const auto after = std::lower_bound(x.begin(), x.end(), time);
+                        if (after == x.begin() || after == x.end()) continue;
+                        const size_t right = static_cast<size_t>(after - x.begin());
+                        if (!std::isfinite(gasTrend[right - 1]) || !std::isfinite(gasTrend[right])) continue;
+                        dotTimes.push_back(time);
+                        dotValues.push_back(gasTrend[right - 1] +
+                            (time - x[right - 1]) * trendRate / 3600.0);
+                    }
+                    ImPlot::PlotScatter(simulation ? "Gas trend (simulated)" : "Gas trend", dotTimes.data(), dotValues.data(),
+                        static_cast<int>(dotTimes.size()), trendStyle);
+                }
+            }
+            ImPlot::SetAxes(ImAxis_X1, ImAxis_Y2);
+            for (size_t i = 0; i < hue.sensors.size(); ++i) {
+                const auto &sensor = hue.sensors[i];
+                std::vector<double> times, values;
+                for (const auto &point : sensor.history) {
+                    times.push_back(point.time);
+                    values.push_back(point.celsius);
+                }
+                // End a disconnected series instead of extending the last reading to now.
+                if (!times.empty()) {
+                    ImPlotSpec temperatureStyle;
+                    temperatureStyle.LineColor = temperatureColors[i % 4];
+                    temperatureStyle.Marker = ImPlotMarker_Circle;
+                    temperatureStyle.MarkerSize = 2.0f;
+                    const std::string label = sensor.name + "###" + sensor.id;
+                    ImPlot::PlotLine(label.c_str(), times.data(), values.data(),
+                        static_cast<int>(times.size()), temperatureStyle);
+                }
+            }
+            if (ImPlot::IsPlotHovered()) {
+                const double mouseTime = ImPlot::GetPlotMousePos(ImAxis_X1, ImAxis_Y1).x;
+                char hoveredTime[16];
+                timeFormatter(mouseTime, hoveredTime, sizeof(hoveredTime), nullptr);
+                ImGui::BeginTooltip();
+                ImGui::TextUnformatted(hoveredTime);
+                ImGui::Separator();
+                // Gas is a staircase: use the reading at or immediately before the cursor.
+                const auto gasAfter = std::upper_bound(x.begin(), x.end(), mouseTime);
+                bool gasAvailable = !x.empty() && mouseTime >= x.front() && mouseTime <= x.back();
+                size_t gasIndex = 0;
+                if (gasAvailable) {
+                    gasIndex = static_cast<size_t>(gasAfter - x.begin() - 1);
+                    gasAvailable = std::isfinite(gasUsage[gasIndex]);
+                    // Missing-data intervals must not imply a known consumption value.
+                    if (gasAfter != x.end() && mouseTime > x[gasIndex])
+                        gasAvailable &= std::isfinite(gasUsage[gasIndex + 1]);
+                }
+                const ImVec4 gasColor(0.75f, 0.5f, 1.0f, 1.0f);
+                if (gasAvailable) {
+                    ImGui::TextColored(gasColor, "Gas usage%s: %.3f m3", gasSuffix, gasUsage[gasIndex]);
+                    ImGui::TextColored(gasColor, "Gas meter%s: %.3f m3", gasSuffix, gasTotals[gasIndex]);
+                    ImGui::TextDisabled("Usage since first visible reading");
+                    if (showGasTrend && std::isfinite(trendRate))
+                        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f),
+                            "Gas trend%s: %.3f m3/h (visible-window estimate)", gasSuffix, trendRate);
+                } else {
+                    ImGui::TextColored(gasColor, "Gas%s: no measurement at this time", gasSuffix);
+                }
+                for (size_t i = 0; i < hue.sensors.size(); ++i) {
+                    const auto &sensor = hue.sensors[i];
+                    const auto &history = sensor.history;
+                    const auto after = std::lower_bound(history.begin(), history.end(), mouseTime,
+                        [](const TemperaturePoint &point, double time) { return point.time < time; });
+                    bool available = !history.empty() && mouseTime >= history.front().time &&
+                        mouseTime <= history.back().time;
+                    size_t selected = 0;
+                    if (available) {
+                        selected = after == history.end() ? history.size() - 1 :
+                            static_cast<size_t>(after - history.begin());
+                        if (selected > 0 && mouseTime - history[selected - 1].time < history[selected].time - mouseTime)
+                            --selected;
+                        available = std::isfinite(history[selected].celsius);
+                        if (after != history.begin() && after != history.end() && after->time != mouseTime)
+                            available &= std::isfinite((after - 1)->celsius) && std::isfinite(after->celsius);
+                    }
+                    if (available) {
+                        char sampledTime[16];
+                        timeFormatter(history[selected].time, sampledTime, sizeof(sampledTime), nullptr);
+                        ImGui::TextColored(temperatureColors[i % 4], "%s: %.2f C (%s)",
+                            sensor.name.c_str(), history[selected].celsius, sampledTime);
+                    } else {
+                        ImGui::TextColored(temperatureColors[i % 4], "%s: no measurement at this time", sensor.name.c_str());
+                    }
+                }
+                ImGui::EndTooltip();
+            }
+            ImPlot::EndPlot();
+        }
+        if (reset)
+            ImGui::TextWrapped("Gas meter reading decreased; usage after the decrease is unavailable in this window.");
+    }
     for (size_t phase = 0; phase < 3; ++phase) {
         if (phase > 0 && !stackedCards)
             ImGui::SameLine();
@@ -672,7 +991,62 @@ static void drawDashboard() {
     ImGui::End();
 }
 
+#endif
+
+static volatile std::sig_atomic_t serverStopRequested = 0;
+static void stopServer(int) { serverStopRequested = 1; }
+
+static json serverSnapshot(HueTemperatures &hue) {
+    const auto temperatures = hue.snapshot();
+    json result = {{"simulation", simulation}, {"now", plotTime()},
+        {"started", std::chrono::duration<double>(programStarted.time_since_epoch()).count()},
+        {"historySeconds", HISTORY_SECONDS}, {"groups", json::array()},
+        {"groupsError", groupsConfigError}, {"samples", json::array()},
+        {"hue", {{"status", temperatures.status}, {"sensors", json::array()}}}};
+    for (const auto &group : circuitGroups)
+        result["groups"].push_back({{"number", group.number}, {"name", group.name},
+            {"phase", group.phase == 0 ? json(nullptr) : json(group.phase)}});
+    {
+        std::lock_guard lock(samplesMutex);
+        const auto finite = [](double value) -> json { return std::isfinite(value) ? json(value) : json(nullptr); };
+        result["measurement"] = {{"valid", measurement.valid}, {"requestFailed", measurement.requestFailed},
+            {"updated", std::chrono::duration<double>(measurement.updated.time_since_epoch()).count()},
+            {"grid", measurement.active_power_w}, {"phases", measurement.active_power_l_w},
+            {"voltage", measurement.voltage}, {"current", json::array()},
+            {"gas", finite(measurement.totalGasM3)}, {"gasTimestamp", measurement.gasTimestamp},
+            {"tariff", measurement.activeTariff}, {"wifiSsid", measurement.wifiSsid},
+            {"wifiStrength", measurement.wifiStrength}};
+        for (double current : measurement.current) result["measurement"]["current"].push_back(finite(current));
+        result["gasSession"] = {{"used", std::isfinite(gasSession.firstTotal) && !gasSession.meterDecreased ?
+            finite(gasSession.latestTotal - gasSession.firstTotal) : json(nullptr)},
+            {"meterDecreased", gasSession.meterDecreased}};
+        for (const auto &sample : samples) {
+            if (sample.time < result["now"].get<double>() - HISTORY_SECONDS) continue;
+            result["samples"].push_back({{"t", sample.time}, {"grid", sample.active_power_w},
+                {"l1", sample.active_power_l_w[0]}, {"l2", sample.active_power_l_w[1]},
+                {"l3", sample.active_power_l_w[2]}, {"gas", finite(sample.totalGasM3)},
+                {"breakBefore", sample.breakBefore}});
+        }
+    }
+    for (const auto &sensor : temperatures.sensors) {
+        json history = json::array();
+        for (const auto &point : sensor.history)
+            history.push_back({{"t", point.time}, {"value", std::isfinite(point.celsius) ? json(point.celsius) : json(nullptr)}});
+        result["hue"]["sensors"].push_back({{"id", sensor.id}, {"name", sensor.name}, {"history", history}});
+    }
+    return result;
+}
+
 int main(int argc, char **argv) {
+    programStarted = std::chrono::system_clock::now();
+#ifdef P1SCOPE_HEADLESS
+    bool serverMode = true;
+#else
+    bool serverMode = false;
+#endif
+    std::string bindAddress = "127.0.0.1";
+    unsigned short httpPort = 8080;
+    std::string webRoot = P1SCOPE_WEB_ROOT;
 
     for (int i = 1; i < argc; ++i) {
         const std::string option = argv[i];
@@ -682,8 +1056,24 @@ int main(int argc, char **argv) {
         }
         if (option == "--report" || option == "-v")
             printCompleteJson = true;
-        else if (option == "--simulation" || option == "-s")
+        else if (option == "--simulation" || option == "--simulated" || option == "-s")
             simulation = true;
+        else if (option == "--server")
+            serverMode = true;
+        else if (option == "--bind" || option == "--port" || option == "--web-root") {
+            if (i + 1 >= argc) { logStderr() << option << " requires a value\n"; return 1; }
+            const std::string value = argv[++i];
+            if (option == "--bind") bindAddress = value;
+            else if (option == "--web-root") webRoot = value;
+            else {
+                try {
+                    size_t consumed = 0;
+                    const int port = std::stoi(value, &consumed);
+                    if (consumed != value.size() || port < 1 || port > 65535) throw std::out_of_range("port");
+                    httpPort = static_cast<unsigned short>(port);
+                } catch (...) { logStderr() << "Invalid HTTP port\n"; return 1; }
+            }
+        }
         else if (option == "--config") {
             if (i + 1 >= argc || std::string(argv[i + 1]).starts_with("--")) {
                 logStderr() << "--config requires a file path\n";
@@ -701,15 +1091,28 @@ int main(int argc, char **argv) {
 
     logStderr() << "P1Scope started\n";
 
-    if (!simulation && curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
+    if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
         logStderr() << "Failed to initialize cURL globally\n";
         return 1;
     }
     struct CurlCleanup {
-        ~CurlCleanup() { if (!simulation) curl_global_cleanup(); }
+        ~CurlCleanup() { curl_global_cleanup(); }
     } curlCleanup;
+    HueTemperatures hue(simulation);
     std::thread reader(p1Thread);
 
+    if (serverMode) {
+        std::signal(SIGINT, stopServer);
+        std::signal(SIGTERM, stopServer);
+        const int result = serveDashboard(bindAddress, httpPort, webRoot, running,
+            [] { return serverStopRequested != 0; },
+            [&] { return serverSnapshot(hue).dump(); },
+            [] { const bool ok = loadGroupsConfig(); return json{{"ok", ok}, {"error", groupsConfigError}}.dump(); });
+        running = false;
+        reader.join();
+        return result;
+    }
+#ifndef P1SCOPE_HEADLESS
     glfwInitHint(GLFW_PLATFORM, GLFW_PLATFORM_X11);
 
     if (!glfwInit()) {
@@ -751,7 +1154,7 @@ int main(int argc, char **argv) {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        drawDashboard();
+        drawDashboard(hue.snapshot());
         ImGui::Render();
 
 
@@ -776,6 +1179,6 @@ int main(int argc, char **argv) {
 
     glfwDestroyWindow(window);
     glfwTerminate();
-
+#endif
     return 0;
 }
