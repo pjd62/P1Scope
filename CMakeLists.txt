@@ -40,3 +40,7 @@ target_link_libraries(p1scope PRIVATE
         glfw
         OpenGL::GL
 )
+# Keep one editable configuration, also when launched from a build directory.
+target_compile_definitions(p1scope PRIVATE
+        P1SCOPE_GROUPS_CONFIG="${CMAKE_CURRENT_SOURCE_DIR}/groups.json"
+)

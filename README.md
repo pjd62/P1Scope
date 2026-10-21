@@ -109,6 +109,7 @@ Print the simulated JSON reports as well:
 | --- | --- | --- |
 | `--simulation` | `-s` | Generate local P1 reports without Avahi discovery or HTTP requests. |
 | `--report` | `-v` | Print each successful live or simulated JSON report to stdout. |
+| `--config PATH` | | Load group assignments from another JSON file. |
 | `--help` | `-h` | Show usage and examples. |
 
 Options can be combined in any order. Use separate short options (`-s -v`); combined forms such as `-sv` are not supported.
@@ -124,7 +125,7 @@ Rebuild after modifying the source; changes to help text and behavior do not app
 ## Dashboard controls
 
 - **History:** choose 1, 5, or 10 minutes. Up to ten minutes of data are retained in memory, so switching views does not discard the other samples.
-- **25 A reference:** show or hide the ±5,750 W reference lines. Hiding them allows the Y-axis to zoom in on smaller variations.
+- **25 A reference:** show or hide the ±5,750 W reference lines (off by default). Hiding them allows the Y-axis to zoom in on smaller variations.
 - **Hover:** move over the plot to see the nearest sample's timestamp and power values. Missing-data intervals are identified rather than interpolated in the tooltip.
 - **Legend:** click a series' color icon to toggle its curve. Right-click the plot and open **Legend** to change its position or orientation. The default is the top-right corner.
 - **Resize:** the plot follows the available window size; small windows can scroll to reach the phase cards.
@@ -134,6 +135,29 @@ The initial time window grows from the first reading, so an empty area to the ri
 Positive phase power represents import and negative phase power represents export. The grid header shows the total's magnitude with an import/export label. Live total and phase values are taken independently from the meter; the application does not recalculate the reported total.
 
 The current bars use the magnitude of measured phase current, not an estimate calculated from active power. The ±5,750 W lines are based on **25 A × 230 V at power factor 1**, apply to each phase individually, and are not exact fuse trip thresholds. Reference values are configured in `main.cpp` using `MAIN_FUSE_CURRENT_A` and `NOMINAL_PHASE_VOLTAGE_V`.
+
+## Circuit groups per phase
+
+Edit `groups.json` to describe which circuit groups are connected to each phase.
+The seven initial entries are unassigned because the actual wiring is unknown.
+For example, replace an entry with:
+
+```json
+{ "number": 1, "name": "Keuken", "phase": 2 }
+```
+
+`phase` accepts `1`, `2`, `3`, or `null` for an unknown assignment. Group numbers
+must be positive and unique; names must contain text. You may add or remove groups.
+Assigned groups appear in the matching phase card, using the same phase colors as
+the graph. Unassigned groups appear above the graph. This is a wiring overview;
+the P1 meter measures power per phase, so it does not provide individual group readings.
+
+The default configuration is `groups.json` in the source directory, independent of
+the working directory. You can select another file with
+`./build/p1scope --config /path/to/groups.json`. Click **Reload groups** after editing;
+no rebuild or restart is needed. An invalid configuration displays an error and
+keeps the last successfully loaded assignments. On initial failure, the dashboard
+continues without assignments.
 
 ## Simulation
 

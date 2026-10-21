@@ -23,6 +23,9 @@
 #include <limits>
 #include <cstring>
 #include <random>
+#include <fstream>
+#include <set>
+#include <stdexcept>
 
 using namespace std;
 using json = nlohmann::ordered_json; // Prevent dump to reorder
@@ -30,6 +33,55 @@ using json = nlohmann::ordered_json; // Prevent dump to reorder
 static bool printCompleteJson = false;
 static bool simulation = false;
 static string p1_ip_address = "";
+
+struct CircuitGroup {
+    int number;
+    std::string name;
+    int phase; // 0 means the phase has not been assigned yet.
+};
+
+#ifndef P1SCOPE_GROUPS_CONFIG
+#define P1SCOPE_GROUPS_CONFIG "groups.json"
+#endif
+static std::string groupsConfigPath = P1SCOPE_GROUPS_CONFIG;
+static std::vector<CircuitGroup> circuitGroups;
+static std::string groupsConfigError;
+
+static bool loadGroupsConfig() {
+    try {
+        std::ifstream file(groupsConfigPath);
+        if (!file)
+            throw std::runtime_error("Cannot open configuration file");
+        const json config = json::parse(file);
+        if (!config.is_object() || !config.contains("groups") || !config["groups"].is_array())
+            throw std::runtime_error("Expected an object with a 'groups' array");
+        std::vector<CircuitGroup> next;
+        std::set<int> numbers;
+        for (const auto &group : config["groups"]) {
+            if (!group.is_object() || !group.contains("number") || !group["number"].is_number_integer() ||
+                !group.contains("name") || !group["name"].is_string() || !group.contains("phase"))
+                throw std::runtime_error("Each group needs an integer number, a name and a phase");
+            if (group["number"] < 1 || group["number"] > std::numeric_limits<int>::max())
+                throw std::runtime_error("Group numbers must be positive integers");
+            const int number = group["number"].get<int>();
+            const std::string name = group["name"].get<std::string>();
+            if (name.empty() || name.find_first_not_of(" \t\r\n") == std::string::npos ||
+                name.find('\0') != std::string::npos || !numbers.insert(number).second)
+                throw std::runtime_error("Group numbers must be unique and names must not be empty");
+            const auto &phase = group["phase"];
+            if (!phase.is_null() && (!phase.is_number_integer() || phase < 1 || phase > 3))
+                throw std::runtime_error("Group phase must be 1, 2, 3 or null (unassigned)");
+            next.push_back({number, name, phase.is_null() ? 0 : phase.get<int>()});
+        }
+        circuitGroups = std::move(next);
+        groupsConfigError.clear();
+        return true;
+    } catch (const std::exception &e) {
+        groupsConfigError = e.what();
+        logStderr() << "Groups configuration " << groupsConfigPath << ": " << groupsConfigError << '\n';
+        return false; // Preserve the previous configuration on a failed reload.
+    }
+}
 
 struct Sample {
     double time;
@@ -344,6 +396,7 @@ OPTIONS:
     --report, -v   : Print each live or simulated P1 JSON report
     --simulation, -s : Generate random P1 reports once per second;
                     no meter, Avahi discovery or HTTP connection required
+    --config PATH : Load circuit groups from a JSON file
     --help, -h    : Show this help
 
 Options can be combined in any order.
@@ -357,7 +410,7 @@ Options can be combined in any order.
 }
 
 static void drawDashboard() {
-    static bool showReference = true;
+    static bool showReference = false;
     const char *seriesNames[] = {"Grid", "L1", "L2", "L3"};
     const ImVec4 seriesColors[] = {
         ImVec4(0.95f, 0.80f, 0.20f, 1.0f), // Grid: yellow
@@ -432,6 +485,19 @@ static void drawDashboard() {
         ImGui::EndTable();
     }
     ImGui::Separator();
+    if (ImGui::Button("Reload groups"))
+        loadGroupsConfig();
+    ImGui::SameLine();
+    ImGui::TextDisabled("Group configuration");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", groupsConfigPath.c_str());
+    if (!groupsConfigError.empty()) {
+        ImGui::TextWrapped("Groups: %s. Previous configuration retained, if available.", groupsConfigError.c_str());
+    }
+    for (const auto &group : circuitGroups) {
+        if (group.phase == 0)
+            ImGui::TextWrapped("Unassigned: %d - %s", group.number, group.name.c_str());
+    }
     static int timeRange = 2;
     const double durations[] = {60.0, 300.0, 600.0};
     ImGui::TextUnformatted("History");
@@ -451,10 +517,30 @@ static void drawDashboard() {
 
     // Stack phase cards on narrow windows; preserve scrolling at small heights.
     const bool stackedCards = ImGui::GetContentRegionAvail().x < 660.0f;
-    const float cardHeight = ImGui::GetTextLineHeightWithSpacing() * 4.0f +
-        ImGui::GetFrameHeight() + 2.0f * ImGui::GetStyle().WindowPadding.y;
-    const float cardsHeight = (stackedCards ? 3 : 1) *
-        (cardHeight + ImGui::GetStyle().ItemSpacing.y);
+    const float cardWidth = stackedCards ? ImGui::GetContentRegionAvail().x :
+        (ImGui::GetContentRegionAvail().x - 2 * ImGui::GetStyle().ItemSpacing.x) / 3.0f;
+    const auto &style = ImGui::GetStyle();
+    const float textWidth = std::max(1.0f, cardWidth -
+        2.0f * (style.WindowPadding.x + style.ChildBorderSize));
+    float cardHeights[3]{};
+    float cardsHeight = 0.0f;
+    for (int phase = 0; phase < 3; ++phase) {
+        float groupsHeight = 0.0f;
+        for (const auto &group : circuitGroups) {
+            if (group.phase == phase + 1) {
+                const std::string label = std::to_string(group.number) + " - " + group.name;
+                groupsHeight += ImGui::CalcTextSize(label.c_str(), nullptr, false, textWidth).y +
+                    style.ItemSpacing.y;
+            }
+        }
+        if (groupsHeight == 0.0f)
+            groupsHeight = ImGui::GetTextLineHeightWithSpacing();
+        cardHeights[phase] = ImGui::GetTextLineHeightWithSpacing() * 5.0f +
+            ImGui::GetFrameHeight() + 2.0f * style.WindowPadding.y +
+            2.0f * style.ChildBorderSize + groupsHeight;
+    }
+    const float cardHeight = *std::max_element(std::begin(cardHeights), std::end(cardHeights));
+    cardsHeight = (stackedCards ? 3.0f : 1.0f) * (cardHeight + style.ItemSpacing.y);
     const ImVec2 plotSize(-1, std::max(160.0f, ImGui::GetContentRegionAvail().y - cardsHeight));
 
     double peakPower = showReference ? PHASE_POWER_REFERENCE_W : 0.0;
@@ -541,8 +627,6 @@ static void drawDashboard() {
 
         ImPlot::EndPlot();
     }
-    const float cardWidth = stackedCards ? ImGui::GetContentRegionAvail().x :
-        (ImGui::GetContentRegionAvail().x - 2 * ImGui::GetStyle().ItemSpacing.x) / 3.0f;
     for (size_t phase = 0; phase < 3; ++phase) {
         if (phase > 0 && !stackedCards)
             ImGui::SameLine();
@@ -568,6 +652,17 @@ static void drawDashboard() {
             } else {
                 ImGui::TextDisabled("Waiting for data...");
             }
+            ImGui::Separator();
+            ImGui::TextDisabled("Groups");
+            bool hasGroups = false;
+            for (const auto &group : circuitGroups) {
+                if (group.phase == static_cast<int>(phase + 1)) {
+                    ImGui::TextWrapped("%d - %s", group.number, group.name.c_str());
+                    hasGroups = true;
+                }
+            }
+            if (!hasGroups)
+                ImGui::TextDisabled("No groups assigned");
         }
         ImGui::EndChild();
         ImGui::PopStyleColor();
@@ -589,12 +684,20 @@ int main(int argc, char **argv) {
             printCompleteJson = true;
         else if (option == "--simulation" || option == "-s")
             simulation = true;
-        else {
+        else if (option == "--config") {
+            if (i + 1 >= argc || std::string(argv[i + 1]).starts_with("--")) {
+                logStderr() << "--config requires a file path\n";
+                return 1;
+            }
+            groupsConfigPath = argv[++i];
+        } else {
             logStderr() << "Unknown option: " << option << '\n';
             printHelp(argv[0]);
             return 1;
         }
     }
+
+    loadGroupsConfig();
 
     logStderr() << "P1Scope started\n";
 
