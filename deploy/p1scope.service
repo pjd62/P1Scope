@@ -1,0 +1,19 @@
+[Unit]
+Description=P1Scope LAN energy dashboard
+Wants=network-online.target avahi-daemon.service
+After=network-online.target avahi-daemon.service
+
+[Service]
+Type=simple
+User=p1scope
+WorkingDirectory=/opt/p1scope
+ExecStart=/opt/p1scope/build-server/p1scope-server --bind 0.0.0.0 --port 8080
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

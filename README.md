@@ -8,7 +8,7 @@ A simulation mode lets you use the dashboard without a meter or network connecti
 
 ![P1Scope dashboard with electricity, gas usage, room temperatures, and phase groups](docs/dashboard.png)
 
-*Dashboard example with simulated readings and 30 minutes of generated history; the plots show the selected 10-minute window.*
+*Desktop dashboard example with simulated readings and 30 minutes of generated history; the plots show the selected 10-minute window.*
 
 ## Features
 
@@ -93,7 +93,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 ```
 
-The resulting executable is `build/p1scope`.
+The default build produces `build/p1scope` (desktop) and `build/p1scope-server` (headless web server).
 
 In CLion, open the project as a CMake project, select a compatible toolchain, and build the `p1scope` target. Enter command-line options in the run configuration's program arguments.
 
@@ -122,6 +122,10 @@ Print the simulated JSON reports as well:
 | `--simulation` / `--simulated` | `-s` | Generate local P1 reports without Avahi discovery or HTTP requests. |
 | `--report` | `-v` | Print each successful live or simulated JSON report to stdout. |
 | `--config PATH` | | Load group assignments from another JSON file. |
+| `--server` | | Run the desktop executable as a headless HTTP server instead of opening a window. The `p1scope-server` executable always uses server mode. |
+| `--bind ADDRESS` | | IPv4 address to listen on in server mode; default `127.0.0.1`. Use `0.0.0.0` for LAN access. |
+| `--port PORT` | | HTTP port in server mode; default `8080`. |
+| `--web-root PATH` | | Directory containing `index.html`, `dashboard.js`, `dashboard.css`, and `vendor/`; defaults to the project's `web/` directory. |
 | `--help` | `-h` | Show usage and examples. |
 
 Options can be combined in any order. Use separate short options (`-s -v`); combined forms such as `-sv` are not supported.
@@ -240,7 +244,84 @@ This starts a temporary localhost server in simulation mode and checks readings,
 Hue simulation, assets, group reloads, blocked credential paths, and shutdown.
 It does not require real devices or a graphical display.
 
-## Dashboard controls
+## Web interface
+
+Open `http://SERVER-IP:8080` after starting `p1scope-server` as described above.
+The web dashboard reads from the running server; opening `web/index.html` directly
+as a local file will not connect it to the meters. No browser extension or app
+installation is needed. The layout adapts to desktop and phone screens, with
+phase cards stacked vertically on narrow screens.
+
+The header shows grid import/export, the active tariff, gas used since server
+startup with elapsed time, the total gas reading and its update time, and P1/Hue
+connection status. Successful Hue connections include the bridge address and the
+number of temperature sensors found. Simulation is marked in the header and gas
+readouts; simulated temperature sensors are named accordingly.
+
+### Browser controls
+
+| Control | Behavior |
+| --- | --- |
+| **History** | Select 1, 5, 10, or 30 minutes, or 1 hour. Both plots use the same selection; the web default is 1 hour. |
+| **25 A reference** | Show dashed ±5,750 W references per phase. Off by default. |
+| **Gas & temperatures** | Show or hide the combined plot. Gas uses the left axis in m³; room temperatures use the right axis in °C. |
+| **Gas trend** | Show or hide the dotted yellow linear trendline. On by default. The hover details include its estimated rate in m³/hour. |
+| **Legend** | Click a label in the top-right legend to toggle that curve and its tooltip entry. |
+| **Hover / tap** | Move over a plot for shared time and reading details. Tap or click to pin the details; tap or click again to release them. Missing readings are marked unavailable. |
+| **Reload groups** | Reread the server's `groups.json` without restarting. Invalid changes retain the last valid configuration. |
+
+Current temperature readouts use the same colors as their plot lines. The phase
+cards show power, voltage, current relative to 25 A, and the groups assigned to
+each phase. Groups with an unknown phase appear below the cards. Group editing
+is done in the server-side JSON file; the browser reload button applies changes.
+
+History selection, reference visibility, plot visibility, and legend choices are
+stored in each browser's local storage. Clients can choose different views while
+sharing the same server measurements. History starts collecting when the server
+starts; selecting 1 hour does not retrieve older data from the meters.
+
+### Status and troubleshooting
+
+- **DISCONNECTED:** the browser cannot reach the server. Displayed readings are
+  stale and the browser retries automatically. Check the process/service, LAN
+  address, port, and firewall. A remote device cannot access a server bound only
+  to `127.0.0.1`; start it with `--bind 0.0.0.0` or its LAN IPv4 address.
+- **P1: waiting for readings / stale:** the web connection works, but meter data
+  is not available or has stopped updating. Check the server logs and meter
+  connectivity. Startup discovery failure stops the process; the example systemd
+  service then retries by restarting it.
+- **Hue unavailable:** gas and electricity continue. Check the credentials file
+  on the server and its ownership. Rejected pairing is reported explicitly;
+  pair again and restart the server. A connected bridge with zero temperature
+  sensors is also reported explicitly.
+- **Chart library missing:** ensure `web/vendor/d3.min.js` is present under the
+  selected web root. Web assets are bundled locally; loading charts does not
+  require an internet connection.
+
+Web plot timestamps use the browser's local timezone. The formatted gas meter
+timestamp and diagnostic logs come from the server, so align the browser and
+server timezones if these appear different.
+
+### HTTP endpoints
+
+| Method and path | Purpose |
+| --- | --- |
+| `GET /` | Serve the dashboard. |
+| `GET /api/state` | Return the latest P1 measurement, retained electricity/gas history, session gas use, groups, and Hue temperature history/status as JSON. |
+| `POST /api/groups/reload` | Reload group assignments. Requires the header `X-P1Scope-Action: reload`; returns `ok` and `error`. |
+
+For example, inspect the server from another LAN machine:
+
+```bash
+curl http://SERVER-IP:8080/api/state
+```
+
+Credentials stay on the server and are not included in API responses. These
+endpoints have no authentication and are intended for the same trusted LAN as
+the dashboard. Requests to unlisted files, including `.hue-credentials.json`,
+are rejected.
+
+## Desktop dashboard controls
 
 - **History:** choose 1, 5, 10, or 30 minutes, or 1 hour. Up to one hour of data is retained in memory, so switching views does not discard the other samples.
 - **25 A reference:** show or hide the ±5,750 W reference lines (off by default). Hiding them allows the Y-axis to zoom in on smaller variations.
@@ -293,7 +374,7 @@ If a group's phase is not yet known, use `null` without quotes:
 
 Assigned groups appear in the matching phase card. All three cards keep the same
 height, sized to fit the largest group list and wrapped descriptions. Unassigned
-groups appear above the graph. This is a wiring overview; the P1 meter measures
+groups appear above the graph in the desktop UI and below the phase cards in the web UI. This is a wiring overview; the P1 meter measures
 power per phase, so it does not provide individual group readings. Changing the
 file only changes the displayed description and assignment.
 
@@ -412,7 +493,7 @@ Plot timestamps, tooltips, and diagnostic timestamps use the computer's local ti
 
 ### Wayland or display errors
 
-The program explicitly selects X11 to avoid the previously observed Wayland/GDK protocol error. Under Wayland, XWayland must be available. Simulation still needs a graphical display; it is not a headless mode.
+The desktop application explicitly selects X11 to avoid the previously observed Wayland/GDK protocol error. Under Wayland, XWayland must be available. Desktop simulation still needs a graphical display. For a server without a display, use `p1scope-server --simulation` or `p1scope --server --simulation`.
 
 ### CMake or dependency errors
 
@@ -434,4 +515,4 @@ Confirm the CMake and GLFW minimum versions above. If CMake fails with a Snap/Ap
 | `external/imgui` | Dear ImGui sources and GLFW/OpenGL backends. |
 | `external/implot` | ImPlot sources. |
 
-History is kept in memory only and is lost when the program exits. The application does not currently record sessions or export measurements.
+History is kept in memory only and is lost when the program exits. The web server exposes its current readings and retained history through `/api/state`; the application does not currently persist sessions or provide a file export.

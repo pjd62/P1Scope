@@ -1,0 +1,11 @@
+{
+  "groups": [
+    { "number": 1, "name": "Woonkamer, IR paneel, Magnetron", "phase": 1 },
+    { "number": 2, "name": "Hal, C.V.", "phase": 1 },
+    { "number": 3, "name": "Slaapkamers, Airco, IR paneel", "phase": 2 },
+    { "number": 4, "name": "Oven", "phase": 2 },
+    { "number": 5, "name": "Wasmachine", "phase": 3 },
+    { "number": 6, "name": "Droger, Vaatwasser, Airfryer", "phase": 3 },
+    { "number": 7, "name": "Tuin, Heater", "phase": 3 }
+  ]
+}
