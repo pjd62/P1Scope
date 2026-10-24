@@ -6,7 +6,7 @@ let snapshot = null;
 let stored = {};
 try { stored = JSON.parse(localStorage.getItem('p1scope-view') || '{}'); } catch (_) {}
 const state = {minutes: [1,5,10,30,60].includes(stored.minutes) ? stored.minutes : 60,
-    reference: !!stored.reference, hybrid: stored.hybrid !== false, trend: stored.trend !== false,
+    reference: !!stored.reference, hybrid: stored.hybrid !== false, 'phase-cards': stored['phase-cards'] !== false,
     hidden: new Set(Array.isArray(stored.hidden) ? stored.hidden : [])};
 const colors = {grid:'--p-gridline', l1:'--p-l1', l2:'--p-l2', l3:'--p-l3', gas:'--p-gas', trend:'--p-trend'};
 const palette = ['--p-l2','--p-l1','--p-l3','--p-gas'];
@@ -44,24 +44,86 @@ function legend(selector, series) {
         box.append(button);
     }
 }
+const lightsDialog = $('.p-lights');
+$('[data-lights-open]').addEventListener('click', () => lightsDialog.showModal());
+$('[data-lights-close]').addEventListener('click', () => lightsDialog.close());
+let lightSending = false, lightError = '';
+$('[data-show-unavailable]').addEventListener('change', renderLights);
+function renderLights() {
+    const hue = snapshot.hue, lights = hue.lights || [];
+    $('[data-lights-status]').textContent = (hue.lightsStatus || hue.status) +
+        (!hue.lightsAvailable && lights.length ? ' · Last known lights; states may be out of date.' : '');
+    $('[data-lights-count]').textContent = hue.lightsAvailable && !lights.length ?
+        'No lights found on this bridge.' : lights.length + ' light(s), ' + lights.filter(light => light.reachable === false).length + ' unavailable';
+    $('[data-lights-action]').textContent = lightError || hue.lightActionStatus || '';
+    const list = $('[data-lights-list]');
+    if (list.contains(document.activeElement) && document.activeElement.type === 'range' && !lightSending) return;
+    list.replaceChildren();
+    let previousRoom;
+    for (const light of lights) {
+        if (light.reachable === false && !$('[data-show-unavailable]').checked) continue;
+        const roomId = light.roomId || '';
+        if (previousRoom !== roomId) {
+            const heading = node('tr', null, 'p-light-room'), title = node('th', light.room || 'Unassigned');
+            title.colSpan = 3; title.scope = 'rowgroup'; heading.append(title); list.append(heading);
+            previousRoom = roomId;
+        }
+        const row = node('tr');
+        row.append(node('td', light.name + (light.reachable === false ? ' (unavailable)' : '')));
+        const control = node('td'), button = node('button', light.on ? 'Turn off' : 'Turn on', 'p-series');
+        button.type = 'button';
+        button.classList.add('p-light-toggle');
+        button.dataset.on = String(light.on);
+        button.setAttribute('aria-label', (light.on ? 'Turn off ' : 'Turn on ') + light.name);
+        button.disabled = lightSending || !!hue.pendingLight || !hue.lightsAvailable || light.reachable === false;
+        const sendChange = async action => {
+            lightSending = true; lightError = ''; renderLights();
+            try {
+                const response = await fetch('/api/hue/lights/' + encodeURIComponent(light.id) + '/' + action,
+                    {method:'POST', headers:{'X-P1Scope-Action':'light'}, signal:AbortSignal.timeout(8000)});
+                if (!response.ok) throw Error('Light change request failed');
+                const result = await response.json();
+                if (!result.ok) throw Error(result.error || 'Light change rejected');
+                await poll();
+            } catch (error) { lightError = error.message || 'Could not change light'; }
+            finally { lightSending = false; renderLights(); }
+        };
+        button.addEventListener('click', () => sendChange(light.on ? 'off' : 'on'));
+        control.append(button); row.append(control);
+        const brightness = node('td');
+        if (finite(light.brightness)) {
+            const slider = node('input'), label = node('output', number(light.brightness) + '%');
+            slider.type = 'range'; slider.min = '0'; slider.max = '100'; slider.step = '1'; slider.value = Math.round(light.brightness);
+            slider.setAttribute('aria-label', 'Brightness for ' + light.name);
+            slider.disabled = button.disabled;
+            slider.addEventListener('input', () => { label.textContent = slider.value + '%'; });
+            slider.addEventListener('change', () => sendChange('brightness-' + slider.value));
+            brightness.append(slider, label);
+        } else brightness.textContent = 'Unavailable';
+        row.append(brightness); list.append(row);
+    }
+}
 function render() {
     if(!snapshot)return;
+    renderLights();
     const m=snapshot.measurement,sim=snapshot.simulation?' (simulated)':'';
     $('select').value=state.minutes;
-    for(const key of ['reference','hybrid','trend'])$('[data-'+key+']').checked=state[key];
+    for(const key of ['reference','hybrid','phase-cards'])$('[data-'+key+']').checked=state[key];
     $('[data-hybrid-panel]').hidden=!state.hybrid;
+    $('[data-phases]').hidden=!state['phase-cards'];
     $('[data-status]').textContent=snapshot.simulation?'SIMULATION · Generated readings':'LIVE · Local network';
     $('[data-grid-label]').textContent='Grid '+(m.grid>=0?'import':'export')+sim;
     $('[data-grid-value]').textContent=m.valid?number(Math.abs(m.grid))+' W':'Waiting…';
     $('[data-tariff]').textContent=m.valid?'Tariff '+m.tariff:'';
     const elapsed=Math.max(0,Math.floor(snapshot.now-snapshot.started));
-    $('[data-session-label]').textContent='Gas used since startup'+sim+' · '+Math.floor(elapsed/3600)+'h '+String(Math.floor(elapsed/60)%60).padStart(2,'0')+'m '+String(elapsed%60).padStart(2,'0')+'s';
-    $('[data-session]').textContent=number(snapshot.gasSession.used,3)+(finite(snapshot.gasSession.used)?' m³':'');
-    if(snapshot.gasSession.meterDecreased)$('[data-session]').textContent='Unavailable: meter decreased';
+    $('[data-session-label]').textContent='Gas used since startup'+sim+' ('+Math.floor(elapsed/3600)+'h '+String(Math.floor(elapsed/60)%60).padStart(2,'0')+'m '+String(elapsed%60).padStart(2,'0')+'s): ';
+    $('[data-session]').textContent=snapshot.gasSession.meterDecreased?'unavailable (meter reading decreased)':
+        finite(snapshot.gasSession.used)?number(snapshot.gasSession.used,3)+' m³ (first to latest received reading)':'waiting for first gas reading';
     $('[data-gas-meter]').textContent='Gas meter'+sim+': '+number(m.gas,3)+' m³ · Updated: '+(m.gasTimestamp||'unavailable');
     const stale=m.valid&&(m.requestFailed||snapshot.now-m.updated>3);
-    $('[data-p1-status]').textContent=!m.valid?'P1: waiting for readings':stale?'P1: stale — '+Math.floor(snapshot.now-m.updated)+' s since last reading':'P1: '+(snapshot.simulation?'simulated readings':'connected');
-    $('[data-hue-status]').textContent=snapshot.hue.status;
+    const connection=!m.valid?'P1: waiting for readings':stale?'P1: stale — '+Math.floor(snapshot.now-m.updated)+' s since last reading':'P1: '+(snapshot.simulation?'simulated readings':'connected');
+    const wifi='Wi-Fi: '+(m.wifiSsid || 'unavailable')+' | '+(finite(m.wifiStrength)&&m.wifiStrength>=0?number(m.wifiStrength)+'%':'unavailable');
+    $('[data-p1-status]').textContent=m.valid&&!stale?wifi:connection+' | '+wifi;
     if(snapshot.groupsError)$('[data-error]').textContent='Groups: '+snapshot.groupsError;
     const sensors=snapshot.hue.sensors;
     const readouts=$('[data-temperatures]');readouts.replaceChildren();
@@ -95,19 +157,26 @@ function render() {
     const slope=valid.length>=2&&variance>0?d3.sum(valid,p=>(p.t-start-meanT)*(p.usage-meanG))/variance:null;
     const trend=t=>finite(slope)?meanG+slope*(t-start-meanT):null;
     const powerSeries=[['grid','Grid'],['l1','L1'],['l2','L2'],['l3','L3']].map(([id,name])=>({id,name,color:colors[id]}));
-    const heatSeries=[{id:'gas',name:'Gas'+sim,color:colors.gas},...(state.trend?[{id:'trend',name:'Gas trend'+sim,color:colors.trend}]:[]),...sensors.map((sensor,i)=>({id:'temp-'+sensor.id,name:sensor.name,color:palette[i%palette.length],sensor}))];
+    const heatSeries=[{id:'gas',name:'Gas'+sim,color:colors.gas},{id:'trend',name:'Gas trend'+sim,color:colors.trend},...sensors.map((sensor,i)=>({id:'temp-'+sensor.id,name:sensor.name,color:palette[i%palette.length],sensor}))];
     legend('[data-power-legend]',powerSeries);legend('[data-heat-legend]',heatSeries);
-    draw('[data-power]','power',powerSeries);if(state.hybrid)draw('[data-heat]','heat',heatSeries);
+    if(state.hybrid)draw('[data-heat]','heat',heatSeries);
+    draw('[data-power]','power',powerSeries);
     function draw(selector,kind,series) {
         const element=$(selector),width=Math.max(250,element.parentElement.clientWidth-2*(parseFloat(getComputedStyle(element.parentElement).paddingLeft)||0));
-        const height=kind==='power'?260:270,margin={left:width<500?48:62,right:kind==='heat'?45:16,top:28,bottom:44};
+        // Measure everything outside this chart after applying section visibility.
+        // Subtracting its current height keeps repeated renders from growing the page.
+        const viewportHeight=window.visualViewport?.height || window.innerHeight;
+        const rootRect=root.getBoundingClientRect();
+        const otherHeight=rootRect.height-element.getBoundingClientRect().height;
+        const availableHeight=viewportHeight-(rootRect.top+window.scrollY)-otherHeight;
+        const height=kind==='power'?Math.max(260,Math.floor(availableHeight)):270,margin={left:width<500?48:62,right:kind==='heat'?45:16,top:28,bottom:44};
         const x0=margin.left,x1=width-margin.right,y0=margin.top,y1=height-margin.bottom;
         const svg=d3.select(element).attr('viewBox','0 0 '+width+' '+height).attr('height',height);svg.selectAll('*').remove();
         svg.append('title').text(kind==='power'?'Grid power':'Gas usage and room temperatures');
         const x=d3.scaleLinear().domain([start,end]).range([x0,x1]);
         const active=series.filter(s=>!state.hidden.has(s.id));
         const powerMax=d3.max(data.flatMap(p=>active.map(s=>finite(p[s.id])?Math.abs(p[s.id]):0)))||0;
-        const gasMax=d3.max(gasRows,p=>Math.max(p.usage||0,state.trend?(trend(p.t)||0):0))||0;
+        const gasMax=d3.max(gasRows,p=>Math.max(p.usage||0,!state.hidden.has('trend')?(trend(p.t)||0):0))||0;
         const max=kind==='power'?Math.max(500,powerMax,state.reference?5750:0)*1.12:Math.max(.005,gasMax)*1.15;
         const y=d3.scaleLinear().domain(kind==='power'?[-max,max]:[0,max]).nice().range([y1,y0]);
         const temperatures=sensors.flatMap(s=>s.history.filter(p=>p.t>=start&&p.t<=end&&finite(p.value)).map(p=>p.value));
@@ -154,7 +223,7 @@ function render() {
                 if(finite(value))markers.append('circle').attr('cx',x(time)).attr('cy',(item.sensor?yt:y)(value)).attr('r',3).attr('fill',getComputedStyle(root).getPropertyValue(item.color).trim());
                 if(sampleTime!==null)tip.append(node('small','Received '+clock(sampleTime)));
             }
-            if(kind==='heat'&&state.trend&&!state.hidden.has('trend')&&finite(slope)){const row=node('div');row.append(node('span','Trend estimate'),node('span',number(slope*3600,3)+' m³/h'));tip.append(row);}
+            if(kind==='heat'&&!state.hidden.has('trend')&&finite(slope)){const row=node('div');row.append(node('span','Trend estimate'),node('span',number(slope*3600,3)+' m³/h'));tip.append(row);}
             tip.hidden=false;const r=root.getBoundingClientRect(),sr=element.getBoundingClientRect();
             tip.style.left=Math.max(8,Math.min(root.clientWidth-tip.offsetWidth-8,sr.left-r.left+x(time)+12))+'px';tip.style.top=Math.max(8,sr.top-r.top+y0+8)+'px';
         }
@@ -163,7 +232,7 @@ function render() {
     tip.hidden=true;
 }
 $('select').addEventListener('change',event=>{state.minutes=+event.target.value;persist();render();});
-for(const key of ['reference','hybrid','trend'])$('[data-'+key+']').addEventListener('change',event=>{state[key]=event.target.checked;persist();render();});
+for(const key of ['reference','hybrid','phase-cards'])$('[data-'+key+']').addEventListener('change',event=>{state[key]=event.target.checked;persist();render();});
 $('[data-reload]').addEventListener('click',async()=>{
     try { const response=await fetch('/api/groups/reload',{method:'POST',headers:{'X-P1Scope-Action':'reload'}});if(!response.ok)throw Error('Reload failed');const result=await response.json();$('[data-error]').textContent=result.ok?'Groups reloaded':result.error;await poll(); }catch(_){$('[data-error]').textContent='Could not reload groups';}
 });
@@ -173,6 +242,8 @@ async function poll(){
     finally{clearTimeout(poll.timer);poll.timer=setTimeout(poll,2000);}
 }
 let previousWidth=0;new ResizeObserver(entries=>{const width=entries[0].contentRect.width;if(Math.abs(width-previousWidth)>1){previousWidth=width;render();}}).observe(root);
+window.addEventListener('resize',render);
+window.visualViewport?.addEventListener('resize',render);
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change',render);
 if(typeof d3==='undefined')$('[data-error]').textContent='Chart library missing. Check web/vendor/d3.min.js on the server.';else poll();
 })();

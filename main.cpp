@@ -340,10 +340,8 @@ static void p1Thread() {
         }
 
 
-        std::cout << "HomeWizard P1 found\n"
-                << "  hostname: " << discovery.hostname() << '\n'
-                << "  address : " << discovery.ip() << '\n'
-                << "  port    : " << discovery.port() << '\n';
+        logStderr() << "HomeWizard P1 found: hostname=" << discovery.hostname()
+                    << " address=" << discovery.ip() << " port=" << discovery.port() << '\n';
 
         curl = initCurl(discovery.ip(), discovery.port());
         if (!curl) {
@@ -488,7 +486,7 @@ Options can be combined in any order.
 }
 
 #ifndef P1SCOPE_HEADLESS
-static void drawDashboard(const HueSnapshot &hue) {
+static void drawDashboard(const HueSnapshot &hue, HueTemperatures *controller = nullptr) {
     const char *gasSuffix = simulation ? " (simulated)" : "";
     static bool showReference = false;
     const char *seriesNames[] = {"Grid", "L1", "L2", "L3"};
@@ -544,31 +542,20 @@ static void drawDashboard(const HueSnapshot &hue) {
     const double age = displayed.valid ? std::max(0.0, std::chrono::duration<double>(
         std::chrono::system_clock::now() - displayed.updated).count()) : 0.0;
     const bool stale = displayed.valid && (displayed.requestFailed || age > 3.0);
-    if (ImGui::BeginTable("Header", 2, ImGuiTableFlags_SizingStretchProp)) {
-        ImGui::TableSetupColumn("Power", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-        ImGui::TableSetupColumn("Connection", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-        ImGui::TableNextColumn();
-        if (displayed.valid) {
-            ImGui::TextColored(seriesColors[0], "Grid %s: %.0f W", displayed.active_power_w >= 0 ? "import" : "export",
-                        std::abs(displayed.active_power_w));
-            ImGui::TextWrapped("Tariff: %s", displayed.activeTariff.c_str());
-        } else {
-            ImGui::TextWrapped("Waiting for meter data...");
-        }
-        ImGui::TableNextColumn();
-        const std::string wifi = "Wi-Fi: " + displayed.wifiSsid + " | " +
-            (displayed.wifiStrength >= 0 ? std::to_string(displayed.wifiStrength) + "%" : "unavailable");
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f,
-            ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize(wifi.c_str()).x));
-        ImGui::TextWrapped("%s", wifi.c_str());
-        if (stale)
-            ImGui::TextColored(ImVec4(1, 0.65f, 0.25f, 1), "Stale data - %.0f s ago", age);
-        else if (displayed.valid)
-            ImGui::TextColored(ImVec4(0.3f, 0.85f, 0.55f, 1), simulation ? "SIMULATION - generated data" : "Connected - live data");
-        else
-            ImGui::TextDisabled(displayed.requestFailed ? "Unavailable - retrying" : "Connecting...");
-        ImGui::EndTable();
-    }
+    const std::string wifi = "Wi-Fi: " + displayed.wifiSsid + " | " +
+        (displayed.wifiStrength >= 0 ? std::to_string(displayed.wifiStrength) + "%" : "unavailable");
+    std::string connection;
+    if (stale) connection = "Stale data - " + std::to_string(static_cast<int>(age)) + " s ago";
+    else if (displayed.valid) connection = simulation ? "SIMULATION - generated data" : "Connected - live data";
+    else connection = displayed.requestFailed ? "Unavailable - retrying" : "Connecting...";
+    const std::string connectionAndWifi = connection + " | " + wifi;
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f,
+        ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize(connectionAndWifi.c_str()).x));
+    const ImVec4 connectionColor = stale ? ImVec4(1, 0.65f, 0.25f, 1) : displayed.valid ?
+        ImVec4(0.3f, 0.85f, 0.55f, 1) : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
+    ImGui::PushStyleColor(ImGuiCol_Text, connectionColor);
+    ImGui::TextWrapped("%s", connectionAndWifi.c_str());
+    ImGui::PopStyleColor();
     ImGui::Separator();
     if (ImGui::Button("Reload groups"))
         loadGroupsConfig();
@@ -625,17 +612,12 @@ static void drawDashboard(const HueSnapshot &hue) {
             2.0f * style.ChildBorderSize + groupsHeight;
     }
     const float cardHeight = *std::max_element(std::begin(cardHeights), std::end(cardHeights));
-    cardsHeight = (stackedCards ? 3.0f : 1.0f) * (cardHeight + style.ItemSpacing.y);
+    static bool showPhaseCards = true;
+    cardsHeight = showPhaseCards ? (stackedCards ? 3.0f : 1.0f) * (cardHeight + style.ItemSpacing.y) : 0.0f;
+    cardsHeight += ImGui::GetFrameHeightWithSpacing(); // Keep the toggle visible when cards are hidden.
     static bool showGas = true;
-    ImGui::Checkbox("Gas & temperatures", &showGas);
-    static bool showGasTrend = true;
-    if (showGas) {
-        ImGui::SameLine();
-        ImGui::Checkbox(simulation ? "Gas trend (simulated)" : "Gas trend", &showGasTrend);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Linear fit of received gas readings in the visible window.\nEstimated average trend, not instantaneous flow; gas updates about every 5 minutes.");
-    }
-    const float availablePlotHeight = ImGui::GetContentRegionAvail().y - cardsHeight;
+    const float availablePlotHeight = ImGui::GetContentRegionAvail().y - cardsHeight -
+        ImGui::GetTextLineHeightWithSpacing() - ImGui::GetFrameHeightWithSpacing();
     const float gasPlotHeight = showGas ? std::max(200.0f, availablePlotHeight * 0.4f) : 0.0f;
     const ImVec2 plotSize(-1, std::max(160.0f, availablePlotHeight -
         (showGas ? gasPlotHeight + style.ItemSpacing.y + 4.0f * ImGui::GetTextLineHeightWithSpacing() : 0.0f)));
@@ -724,6 +706,14 @@ static void drawDashboard(const HueSnapshot &hue) {
 
         ImPlot::EndPlot();
     }
+    if (displayed.valid) {
+        ImGui::Text("Tariff: %s", displayed.activeTariff.c_str());
+        ImGui::SameLine();
+        ImGui::TextColored(seriesColors[0], "| Grid %s: %.0f W", displayed.active_power_w >= 0 ? "import" : "export",
+                    std::abs(displayed.active_power_w));
+    } else {
+        ImGui::TextWrapped("Waiting for meter data...");
+    }
     if (showGas) {
         if (std::isfinite(displayed.totalGasM3))
             ImGui::TextWrapped("Gas meter%s: %.3f m3 | Updated: %s%s",
@@ -746,28 +736,82 @@ static void drawDashboard(const HueSnapshot &hue) {
             ImGui::TextDisabled("Gas used since startup%s (%s): waiting for first gas reading", gasSuffix, sessionDuration);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Gas readings arrive about every 5 minutes.\nUsage is relative to the first gas reading received this session;\nconsumption after the latest meter update is not included yet.");
-        ImGui::TextWrapped("%s", hue.status.c_str());
+    }
+    ImGui::Checkbox("Gas & temperatures", &showGas);
+    ImGui::SameLine();
+    if (ImGui::Button("Hue lights")) ImGui::OpenPopup("Hue lights");
+    ImGui::SetNextWindowSize(ImVec2(560, 400), ImGuiCond_FirstUseEver);
+    bool lightsOpen = true;
+    if (ImGui::BeginPopupModal("Hue lights", &lightsOpen)) {
+        ImGui::TextWrapped("%s", hue.lightsStatus.c_str());
+        if (!hue.lightActionStatus.empty()) ImGui::TextWrapped("%s", hue.lightActionStatus.c_str());
+        if (!hue.lightsAvailable && !hue.lights.empty())
+            ImGui::TextWrapped("Showing last known lights; states may be out of date.");
+        if (hue.lightsAvailable && hue.lights.empty()) ImGui::TextUnformatted("No lights found on this bridge.");
+        static bool showUnavailableLights = false;
+        ImGui::Checkbox("Show unavailable lights", &showUnavailableLights);
+        const auto hiddenLights = std::count_if(hue.lights.begin(), hue.lights.end(),
+            [](const auto &light) { return !light.reachable; });
+        ImGui::Text("%zu light(s), %zu unavailable", hue.lights.size(), static_cast<size_t>(hiddenLights));
+        if (ImGui::BeginTable("Lights", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                ImGuiTableFlags_ScrollY, ImVec2(0, -45))) {
+            ImGui::TableSetupColumn("Name");
+            ImGui::TableSetupColumn("Control");
+            ImGui::TableSetupColumn("Brightness");
+            ImGui::TableHeadersRow();
+            std::string previousRoom;
+            bool firstRoom = true;
+            for (const auto &light : hue.lights) {
+                if (!showUnavailableLights && !light.reachable) continue;
+                if (firstRoom || light.roomId != previousRoom) {
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.8f, 1.0f, 1.0f));
+                    ImGui::TextWrapped("%s", light.room.c_str());
+                    ImGui::PopStyleColor();
+                    previousRoom = light.roomId;
+                    firstRoom = false;
+                }
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn(); ImGui::TextWrapped("%s%s", light.name.c_str(), light.reachable ? "" : " (unavailable)");
+                ImGui::TableNextColumn();
+                ImGui::PushID(light.id.c_str());
+                ImGui::BeginDisabled(!controller || !hue.lightsAvailable || !light.reachable || !hue.pendingLight.empty());
+                const ImVec4 toggleColor = light.on ? ImVec4(0.12f, 0.43f, 0.23f, 1) : ImVec4(0.65f, 0.16f, 0.18f, 1);
+                ImGui::PushStyleColor(ImGuiCol_Button, toggleColor);
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, light.on ? ImVec4(0.16f, 0.53f, 0.29f, 1) : ImVec4(0.76f, 0.21f, 0.23f, 1));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, light.on ? ImVec4(0.09f, 0.35f, 0.18f, 1) : ImVec4(0.54f, 0.12f, 0.14f, 1));
+                if (ImGui::Button(light.on ? "Turn off" : "Turn on")) controller->setLight(light.id, !light.on);
+                ImGui::PopStyleColor(3);
+                ImGui::EndDisabled();
+                ImGui::TableNextColumn();
+                if (light.brightness >= 0) {
+                    static std::string editingLight;
+                    static float editingBrightness = 0;
+                    float value = editingLight == light.id ? editingBrightness : static_cast<float>(light.brightness);
+                    ImGui::BeginDisabled(!controller || !hue.lightsAvailable || !light.reachable || !hue.pendingLight.empty());
+                    ImGui::SetNextItemWidth(-1);
+                    if (ImGui::SliderFloat("##brightness", &value, 0, 100, "%.0f%%", ImGuiSliderFlags_AlwaysClamp)) {
+                        editingLight = light.id;
+                        editingBrightness = value;
+                    }
+                    if (ImGui::IsItemDeactivatedAfterEdit()) {
+                        controller->setBrightness(light.id, value);
+                        editingLight.clear();
+                    }
+                    ImGui::EndDisabled();
+                } else ImGui::TextUnformatted("Unavailable");
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        if (ImGui::Button("Close") || ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+    if (showGas) {
         const ImVec4 temperatureColors[] = {
             ImVec4(1.0f, 0.55f, 0.15f, 1.0f), ImVec4(0.2f, 0.8f, 0.9f, 1.0f),
             ImVec4(0.4f, 0.9f, 0.4f, 1.0f), ImVec4(1.0f, 0.4f, 0.6f, 1.0f)};
-        const float readoutRight = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
-        for (size_t i = 0; i < hue.sensors.size(); ++i) {
-            const auto &sensor = hue.sensors[i];
-            std::string readout = sensor.name + ": ";
-            if (!sensor.history.empty() && std::isfinite(sensor.history.back().celsius)) {
-                char reading[32];
-                std::snprintf(reading, sizeof(reading), "%.2f C", sensor.history.back().celsius);
-                readout += reading;
-            } else {
-                readout += "unavailable";
-            }
-            if (i > 0 && ImGui::GetItemRectMax().x + ImGui::GetStyle().ItemSpacing.x +
-                ImGui::CalcTextSize(readout.c_str()).x <= readoutRight)
-                ImGui::SameLine();
-            ImGui::PushStyleColor(ImGuiCol_Text, temperatureColors[i % 4]);
-            ImGui::TextWrapped("%s", readout.c_str());
-            ImGui::PopStyleColor();
-        }
         std::vector<double> gasUsage(x.size(), NAN);
         double baseline = NAN;
         double lastTotal = NAN;
@@ -791,34 +835,33 @@ static void drawDashboard(const HueSnapshot &hue) {
         double trendRate = NAN;
         double sumTime = 0.0, sumUsage = 0.0;
         size_t trendCount = 0;
-        if (showGasTrend) {
+        for (size_t i = 0; i < x.size(); ++i) {
+            if (!std::isfinite(gasUsage[i])) continue;
+            sumTime += x[i] - xmin;
+            sumUsage += gasUsage[i];
+            ++trendCount;
+        }
+        if (trendCount >= 2) {
+            const double meanTime = sumTime / trendCount;
+            const double meanUsage = sumUsage / trendCount;
+            double covariance = 0.0, variance = 0.0;
             for (size_t i = 0; i < x.size(); ++i) {
                 if (!std::isfinite(gasUsage[i])) continue;
-                sumTime += x[i] - xmin;
-                sumUsage += gasUsage[i];
-                ++trendCount;
+                const double delta = (x[i] - xmin) - meanTime;
+                covariance += delta * (gasUsage[i] - meanUsage);
+                variance += delta * delta;
             }
-            if (trendCount >= 2) {
-                const double meanTime = sumTime / trendCount;
-                const double meanUsage = sumUsage / trendCount;
-                double covariance = 0.0, variance = 0.0;
+            if (variance > 0.0) {
+                const double slope = covariance / variance;
+                trendRate = slope * 3600.0;
                 for (size_t i = 0; i < x.size(); ++i) {
                     if (!std::isfinite(gasUsage[i])) continue;
-                    const double delta = (x[i] - xmin) - meanTime;
-                    covariance += delta * (gasUsage[i] - meanUsage);
-                    variance += delta * delta;
-                }
-                if (variance > 0.0) {
-                    const double slope = covariance / variance;
-                    trendRate = slope * 3600.0;
-                    for (size_t i = 0; i < x.size(); ++i) {
-                        if (!std::isfinite(gasUsage[i])) continue;
-                        gasTrend[i] = meanUsage + slope * ((x[i] - xmin) - meanTime);
-                        peakGas = std::max(peakGas, gasTrend[i]);
-                    }
+                    gasTrend[i] = meanUsage + slope * ((x[i] - xmin) - meanTime);
+                    peakGas = std::max(peakGas, gasTrend[i]);
                 }
             }
         }
+
         if (ImPlot::BeginPlot("Gas usage & room temperatures", ImVec2(-1, gasPlotHeight), ImPlotFlags_Crosshairs | ImPlotFlags_NoMouseText)) {
             ImPlot::SetupLegend(ImPlotLocation_NorthEast);
             ImPlot::SetupAxis(ImAxis_X1, "Time (received)");
@@ -834,14 +877,15 @@ static void drawDashboard(const HueSnapshot &hue) {
                     }
             ImPlot::SetupAxisLimits(ImAxis_Y2, minTemp, maxTemp, ImGuiCond_Always);
             ImPlot::SetupAxisFormat(ImAxis_X1, timeFormatter);
-            ImPlot::SetupAxisFormat(ImAxis_Y1, "%.3f");
+            // Keep sub-litre tick intervals distinct when the visible gas range is small.
+            ImPlot::SetupAxisFormat(ImAxis_Y1, peakGas < 0.01 ? "%.4f" : "%.3f");
             ImPlot::SetupAxisLimits(ImAxis_X1, xmin, xmax, ImGuiCond_Always);
             ImPlot::SetupAxisLimits(ImAxis_Y1, 0.0, peakGas * 1.15, ImGuiCond_Always);
             if (!x.empty()) {
                 ImPlotSpec gasStyle;
                 gasStyle.LineColor = ImVec4(0.75f, 0.5f, 1.0f, 1.0f);
                 ImPlot::PlotStairs(simulation ? "Gas (simulated)" : "Gas", x.data(), gasUsage.data(), static_cast<int>(x.size()), gasStyle);
-                if (showGasTrend && std::isfinite(trendRate)) {
+                if (std::isfinite(trendRate)) {
                     ImPlotSpec trendStyle;
                     trendStyle.LineColor = ImVec4(1.0f, 0.85f, 0.3f, 1.0f);
                     trendStyle.Marker = ImPlotMarker_Circle;
@@ -907,7 +951,7 @@ static void drawDashboard(const HueSnapshot &hue) {
                     ImGui::TextColored(gasColor, "Gas usage%s: %.3f m3", gasSuffix, gasUsage[gasIndex]);
                     ImGui::TextColored(gasColor, "Gas meter%s: %.3f m3", gasSuffix, gasTotals[gasIndex]);
                     ImGui::TextDisabled("Usage since first visible reading");
-                    if (showGasTrend && std::isfinite(trendRate))
+                    if (std::isfinite(trendRate))
                         ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f),
                             "Gas trend%s: %.3f m3/h (visible-window estimate)", gasSuffix, trendRate);
                 } else {
@@ -945,8 +989,27 @@ static void drawDashboard(const HueSnapshot &hue) {
         }
         if (reset)
             ImGui::TextWrapped("Gas meter reading decreased; usage after the decrease is unavailable in this window.");
+        const float readoutRight = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
+        for (size_t i = 0; i < hue.sensors.size(); ++i) {
+            const auto &sensor = hue.sensors[i];
+            std::string readout = sensor.name + ": ";
+            if (!sensor.history.empty() && std::isfinite(sensor.history.back().celsius)) {
+                char reading[32];
+                std::snprintf(reading, sizeof(reading), "%.2f C", sensor.history.back().celsius);
+                readout += reading;
+            } else {
+                readout += "unavailable";
+            }
+            if (i > 0 && ImGui::GetItemRectMax().x + ImGui::GetStyle().ItemSpacing.x +
+                ImGui::CalcTextSize(readout.c_str()).x <= readoutRight)
+                ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Text, temperatureColors[i % 4]);
+            ImGui::TextWrapped("%s", readout.c_str());
+            ImGui::PopStyleColor();
+        }
     }
-    for (size_t phase = 0; phase < 3; ++phase) {
+    ImGui::Checkbox("Phase cards", &showPhaseCards);
+    if (showPhaseCards) for (size_t phase = 0; phase < 3; ++phase) {
         if (phase > 0 && !stackedCards)
             ImGui::SameLine();
         ImGui::PushID(static_cast<int>(phase));
@@ -1002,7 +1065,10 @@ static json serverSnapshot(HueTemperatures &hue) {
         {"started", std::chrono::duration<double>(programStarted.time_since_epoch()).count()},
         {"historySeconds", HISTORY_SECONDS}, {"groups", json::array()},
         {"groupsError", groupsConfigError}, {"samples", json::array()},
-        {"hue", {{"status", temperatures.status}, {"sensors", json::array()}}}};
+        {"hue", {{"status", temperatures.status}, {"sensors", json::array()},
+            {"pendingLight", temperatures.pendingLight}, {"lightActionStatus", temperatures.lightActionStatus},
+            {"lightsStatus", temperatures.lightsStatus}, {"lightsAvailable", temperatures.lightsAvailable},
+            {"lights", json::array()}}}};
     for (const auto &group : circuitGroups)
         result["groups"].push_back({{"number", group.number}, {"name", group.name},
             {"phase", group.phase == 0 ? json(nullptr) : json(group.phase)}});
@@ -1028,6 +1094,10 @@ static json serverSnapshot(HueTemperatures &hue) {
                 {"breakBefore", sample.breakBefore}});
         }
     }
+    for (const auto &light : temperatures.lights)
+        result["hue"]["lights"].push_back({{"id", light.id}, {"name", light.name},
+            {"room", light.room}, {"roomId", light.roomId}, {"reachable", light.reachable},
+            {"on", light.on}, {"brightness", light.brightness >= 0 ? json(light.brightness) : json(nullptr)}});
     for (const auto &sensor : temperatures.sensors) {
         json history = json::array();
         for (const auto &point : sensor.history)
@@ -1107,7 +1177,12 @@ int main(int argc, char **argv) {
         const int result = serveDashboard(bindAddress, httpPort, webRoot, running,
             [] { return serverStopRequested != 0; },
             [&] { return serverSnapshot(hue).dump(); },
-            [] { const bool ok = loadGroupsConfig(); return json{{"ok", ok}, {"error", groupsConfigError}}.dump(); });
+            [] { const bool ok = loadGroupsConfig(); return json{{"ok", ok}, {"error", groupsConfigError}}.dump(); },
+            [&](const std::string &id, const std::string &action) {
+                const auto error = action.starts_with("brightness-") ? hue.setBrightness(id, std::stoi(action.substr(11))) :
+                    hue.setLight(id, action == "on");
+                return json{{"ok", error.empty()}, {"error", error}}.dump();
+            });
         running = false;
         reader.join();
         return result;
@@ -1122,7 +1197,7 @@ int main(int argc, char **argv) {
     }
 
     // Create the main application window.
-    GLFWwindow *window = glfwCreateWindow(1000, 600, simulation ? "P1Scope [SIMULATION]" : "P1Scope", nullptr, nullptr);
+    GLFWwindow *window = glfwCreateWindow(1400, 1000, simulation ? "P1Scope [SIMULATION]" : "P1Scope", nullptr, nullptr);
     if (!window) {
         glfwTerminate();
         running = false;
@@ -1154,7 +1229,7 @@ int main(int argc, char **argv) {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        drawDashboard(hue.snapshot());
+        drawDashboard(hue.snapshot(), &hue);
         ImGui::Render();
 
 

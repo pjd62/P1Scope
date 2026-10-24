@@ -45,7 +45,51 @@ with tempfile.TemporaryDirectory(prefix='p1scope-http-test-') as tmp:
             if process.poll() is not None or time.monotonic() > deadline:
                 raise AssertionError('Server failed to become ready')
             time.sleep(.1)
+        assert state['hue']['lightsAvailable'] is True
+        assert len(state['hue']['lights']) == 3
+        assert len({light['roomId'] for light in state['hue']['lights']}) == 3
+        assert all(light['room'] for light in state['hue']['lights'])
+        assert any(light['on'] for light in state['hue']['lights'])
+        assert any(not light['on'] for light in state['hue']['lights'])
+        assert all(0 <= light['brightness'] <= 100 for light in state['hue']['lights'])
         assert status == 200 and state['simulation'] is True
+        light = state['hue']['lights'][0]
+        target = not light['on']
+        route = '/api/hue/lights/' + light['id'] + ('/on' if target else '/off')
+        assert request(route, 'POST')[0] == 403
+        assert request('/api/hue/lights/bad%2Fid/on', 'POST', {'X-P1Scope-Action': 'light'})[0] == 400
+        rejected = json.loads(request('/api/hue/lights/unknown/on', 'POST', {'X-P1Scope-Action': 'light'})[2])
+        assert rejected['ok'] is False
+        changed = json.loads(request(route, 'POST', {'X-P1Scope-Action': 'light'})[2])
+        assert changed['ok'] is True
+        deadline = time.monotonic() + 5
+        while True:
+            updated = json.loads(request('/api/state')[2])['hue']
+            if not updated['pendingLight']:
+                break
+            assert time.monotonic() < deadline
+            time.sleep(.05)
+        assert next(item for item in updated['lights'] if item['id'] == light['id'])['on'] == target
+        assert updated['lightActionStatus'] == 'Simulated light changed'
+        brightness_route = '/api/hue/lights/' + light['id'] + '/brightness-35'
+        assert request(brightness_route, 'POST')[0] == 403
+        for invalid in ['brightness-101', 'brightness--1', 'brightness-nan', 'brightness-', 'brightness-35.5']:
+            assert request('/api/hue/lights/' + light['id'] + '/' + invalid, 'POST', {'X-P1Scope-Action': 'light'})[0] == 400
+        assert json.loads(request(brightness_route, 'POST', {'X-P1Scope-Action': 'light'})[2])['ok']
+        deadline = time.monotonic() + 5
+        while True:
+            updated = json.loads(request('/api/state')[2])['hue']
+            if not updated['pendingLight']:
+                break
+            assert time.monotonic() < deadline
+            time.sleep(.05)
+        changed_light = next(item for item in updated['lights'] if item['id'] == light['id'])
+        assert changed_light['brightness'] == 35
+        assert changed_light['on'] == target
+
+
+
+
         assert state['historySeconds'] == 3600 and state['samples']
         assert len(state['measurement']['phases']) == 3
         assert len(state['hue']['sensors']) == 3
@@ -81,5 +125,7 @@ with tempfile.TemporaryDirectory(prefix='p1scope-http-test-') as tmp:
                 process.kill()
                 process.wait()
         diagnostics = process.stderr.read().decode()
+        if process.returncode == 0:
+            assert f'Web dashboard URL: http://127.0.0.1:{port}/' in diagnostics
         if process.returncode:
             print(diagnostics, file=sys.stderr)

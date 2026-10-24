@@ -2,6 +2,9 @@
 #include "Logging.hxx"
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <set>
 #include <poll.h>
 #include <unistd.h>
 #include <algorithm>
@@ -38,7 +41,8 @@ int serveDashboard(const std::string &bindAddress, unsigned short port,
     const std::string &webRoot, std::atomic<bool> &running,
     const std::function<bool()> &stopRequested,
     const std::function<std::string()> &snapshot,
-    const std::function<std::string()> &reloadGroups) {
+    const std::function<std::string()> &reloadGroups,
+    const std::function<std::string(const std::string &, const std::string &)> &setLight) {
     Socket listener{socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)};
     if (listener.fd < 0) { logStderr() << "Cannot create HTTP socket\n"; return 1; }
     int reuse = 1;
@@ -52,7 +56,24 @@ int serveDashboard(const std::string &bindAddress, unsigned short port,
         logStderr() << "Cannot listen on " << bindAddress << ':' << port << '\n';
         return 1;
     }
-    logStderr() << "Dashboard listening at http://" << bindAddress << ':' << port << '\n';
+    logStderr() << "Dashboard listening on " << bindAddress << ':' << port << '\n';
+    std::set<std::string> dashboardAddresses;
+    if (bindAddress == "0.0.0.0") {
+        dashboardAddresses.insert("127.0.0.1");
+        ifaddrs *interfaces = nullptr;
+        if (getifaddrs(&interfaces) == 0) {
+            for (auto *interface = interfaces; interface; interface = interface->ifa_next) {
+                if (!interface->ifa_addr || interface->ifa_addr->sa_family != AF_INET ||
+                    !(interface->ifa_flags & IFF_UP) || (interface->ifa_flags & IFF_LOOPBACK)) continue;
+                const auto *ipv4 = reinterpret_cast<const sockaddr_in *>(interface->ifa_addr);
+                char host[INET_ADDRSTRLEN];
+                if (inet_ntop(AF_INET, &ipv4->sin_addr, host, sizeof(host))) dashboardAddresses.insert(host);
+            }
+            freeifaddrs(interfaces);
+        }
+    } else dashboardAddresses.insert(bindAddress);
+    for (const auto &host : dashboardAddresses)
+        logStderr() << "Web dashboard URL: http://" << host << ':' << port << "/\n";
     const std::map<std::string, std::pair<std::string, const char *>> assets = {
         {"/", {"index.html", "text/html; charset=utf-8"}},
         {"/index.html", {"index.html", "text/html; charset=utf-8"}},
@@ -92,6 +113,20 @@ int serveDashboard(const std::string &bindAddress, unsigned short port,
             if (lower.find("\r\nx-p1scope-action: reload\r\n") == std::string::npos)
                 respond(client.fd, "403 Forbidden", "text/plain", "Missing action header");
             else respond(client.fd, "200 OK", "application/json", reloadGroups());
+        } else if (method == "POST" && path.starts_with("/api/hue/lights/")) {
+            std::string headers = request.substr(0, request.find("\r\n\r\n") + 2);
+            std::transform(headers.begin(), headers.end(), headers.begin(), [](unsigned char c) { return std::tolower(c); });
+            const auto action = path.find_last_of('/');
+            const auto id = path.substr(16, action > 16 ? action - 16 : 0);
+            const auto value = path.substr(action + 1);
+            const bool brightnessAction = value.starts_with("brightness-") && value.size() > 11 && value.size() <= 14 &&
+                value.substr(11).find_first_not_of("0123456789") == std::string::npos && std::stoi(value.substr(11)) <= 100;
+            if (headers.find("\r\nx-p1scope-action: light\r\n") == std::string::npos)
+                respond(client.fd, "403 Forbidden", "text/plain", "Missing action header");
+            else if (id.empty() || id.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-") != std::string::npos ||
+                     (value != "on" && value != "off" && !brightnessAction))
+                respond(client.fd, "400 Bad Request", "text/plain", "Invalid light action");
+            else respond(client.fd, "200 OK", "application/json", setLight(id, value));
         } else if (method == "GET") {
             const auto asset = assets.find(path);
             if (asset == assets.end()) { respond(client.fd, "404 Not Found", "text/plain", "Not found"); continue; }

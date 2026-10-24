@@ -24,11 +24,40 @@ size_t receive(char *data, size_t size, size_t count, void *target) {
 HueTemperatures::HueTemperatures(bool simulation) : worker([this, simulation] { poll(simulation); }) {}
 HueTemperatures::~HueTemperatures() {
     stopping = true;
+    wake.notify_all();
     worker.join();
 }
 HueSnapshot HueTemperatures::snapshot() {
     std::lock_guard lock(mutex);
     return state;
+}
+std::string HueTemperatures::setLight(const std::string &id, bool on) {
+    return queueLight(id, on, -1);
+}
+std::string HueTemperatures::setBrightness(const std::string &id, double brightness) {
+    if (!std::isfinite(brightness) || brightness < 0 || brightness > 100) return "Brightness must be between 0 and 100";
+    return queueLight(id, std::nullopt, brightness);
+}
+std::string HueTemperatures::queueLight(const std::string &id, std::optional<bool> on, double brightness) {
+    std::lock_guard lock(mutex);
+    if (!state.lightsAvailable) return "Hue lights unavailable";
+    if (!state.pendingLight.empty()) return "Another light change is in progress";
+    if (id.empty() || id.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-") != std::string::npos ||
+        std::none_of(state.lights.begin(), state.lights.end(), [&](const auto &light) { return light.id == id; }))
+        return "Unknown light";
+    if (std::any_of(state.lights.begin(), state.lights.end(), [&](const auto &light) {
+        return light.id == id && !light.reachable;
+    })) return "Light is unavailable";
+    if (!on && std::any_of(state.lights.begin(), state.lights.end(), [&](const auto &light) {
+        return light.id == id && light.brightness < 0;
+    })) return "This light does not support dimming";
+    commandId = id;
+    commandOn = on;
+    commandBrightness = brightness;
+    state.pendingLight = id;
+    state.lightActionStatus = "Changing light...";
+    wake.notify_all();
+    return {};
 }
 void HueTemperatures::poll(bool simulation) {
     std::string base, key, address;
@@ -48,6 +77,7 @@ void HueTemperatures::poll(bool simulation) {
         } catch (...) {
             std::lock_guard lock(mutex);
             state.status = "Hue unavailable: check .hue-credentials.json; pair using hue_temperatures.py --pair";
+            state.lightsStatus = state.status;
             logStderr() << state.status << '\n';
             return;
         }
@@ -56,6 +86,7 @@ void HueTemperatures::poll(bool simulation) {
     if (!simulation && !curl) {
         std::lock_guard lock(mutex);
         state.status = "Hue HTTP initialization failed";
+        state.lightsStatus = state.status;
         logStderr() << state.status << '\n';
         return;
     }
@@ -66,9 +97,11 @@ void HueTemperatures::poll(bool simulation) {
             curl_easy_cleanup(curl);
             std::lock_guard lock(mutex);
             state.status = "Hue HTTP initialization failed";
+            state.lightsStatus = state.status;
             logStderr() << state.status << '\n';
             return;
         }
+        headers = curl_slist_append(headers, "Content-Type: application/json");
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, receive);
         curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 2000L);
@@ -78,16 +111,19 @@ void HueTemperatures::poll(bool simulation) {
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
     }
-    auto get = [&](const char *resource) {
+    auto request = [&](const std::string &resource, const std::string &payload = "") {
         std::string body;
         const auto url = base + resource;
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, payload.empty() ? "GET" : "PUT");
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.empty() ? nullptr : payload.c_str());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(payload.size()));
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
         const auto code = curl_easy_perform(curl);
-        if (code != CURLE_OK)
-            throw HueRequestError(std::string("request failed: ") + curl_easy_strerror(code));
         long status = 0;
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+        if (code != CURLE_OK)
+            throw HueRequestError(std::string("request failed: ") + curl_easy_strerror(code));
         if (status == 401 || status == 403)
             throw HueRequestError("pairing rejected; run hue_temperatures.py --pair and restart");
         if (status != 200) throw HueRequestError("HTTP status " + std::to_string(status));
@@ -97,6 +133,67 @@ void HueTemperatures::poll(bool simulation) {
         return result.at("data");
     };
     while (!stopping) {
+        // Keep light failures independent of temperature collection.
+        std::vector<HueLight> lights;
+        bool lightsAvailable = false;
+        std::string lightsStatus;
+        try {
+            if (simulation) {
+                lights = {{"sim-1", "Living room (simulated)", true, 75, "Living room (simulated)", "room-living"},
+                          {"sim-2", "Hall (simulated)", false, 40, "Hall (simulated)", "room-hall"},
+                          {"sim-3", "Kitchen (simulated)", true, 100, "Kitchen (simulated)", "room-kitchen"}};
+            } else {
+                const auto rooms = request("room");
+                const auto connectivity = request("zigbee_connectivity");
+                for (const auto &light : request("light")) {
+                    HueLight entry{light.at("id").get<std::string>(),
+                        light.at("metadata").at("name").get<std::string>(),
+                        light.at("on").at("on").get<bool>()};
+                    if (light.contains("dimming")) {
+                        const double value = light.at("dimming").at("brightness").get<double>();
+                        if (std::isfinite(value) && value >= 0 && value <= 100) entry.brightness = value;
+                    }
+                    // Hue rooms contain devices; light resources reference their owning device.
+                    const auto owner = light.at("owner").at("rid").get<std::string>();
+                    entry.reachable = false;
+                    for (const auto &connection : connectivity)
+                        if (connection.at("owner").at("rid") == owner && connection.value("status", std::string{}) == "connected")
+                            entry.reachable = true;
+                    for (const auto &room : rooms) {
+                        for (const auto &child : room.at("children")) {
+                            const auto type = child.value("rtype", std::string{});
+                            const auto id = child.at("rid").get<std::string>();
+                            if ((type == "device" && id == owner) || (type == "light" && id == entry.id)) {
+                                entry.room = room.at("metadata").at("name").get<std::string>();
+                                entry.roomId = room.at("id").get<std::string>();
+                            }
+                        }
+                    }
+                    lights.push_back(std::move(entry));
+                }
+            }
+            std::sort(lights.begin(), lights.end(), [](const auto &a, const auto &b) {
+                if (a.roomId.empty() != b.roomId.empty()) return !a.roomId.empty();
+                if (a.room != b.room) return a.room < b.room;
+                if (a.roomId != b.roomId) return a.roomId < b.roomId;
+                return a.name == b.name ? a.id < b.id : a.name < b.name;
+            });
+            lightsAvailable = true;
+            lightsStatus = simulation ? "Simulated lights" : "Updated every 30 seconds";
+        } catch (const HueRequestError &failure) {
+            lightsStatus = std::string("Hue lights unavailable: ") + failure.what() + "; retrying";
+        } catch (...) {
+            lightsStatus = "Hue lights unavailable: invalid bridge response; retrying";
+        }
+        {
+            std::lock_guard lock(mutex);
+            state.lightsAvailable = lightsAvailable;
+            state.lightsStatus = lightsStatus;
+            if (lightsAvailable) {
+                if (simulation && !state.lights.empty()) lights = state.lights;
+                state.lights = std::move(lights);
+            }
+        }
         std::vector<TemperatureSensor> incoming;
         bool success = false;
         std::string error = "invalid bridge response";
@@ -109,8 +206,8 @@ void HueTemperatures::poll(bool simulation) {
                     incoming.push_back({std::to_string(i), names[i],
                         {{now, HeatingSimulation::roomTemperature(i, elapsed)}}});
             } else {
-                const auto devices = get("device");
-                const auto temperatures = get("temperature");
+                const auto devices = request("device");
+                const auto temperatures = request("temperature");
                 for (const auto &sensor : temperatures) {
                     const auto id = sensor.at("id").get<std::string>();
                     const auto owner = sensor.at("owner").at("rid").get<std::string>();
@@ -164,8 +261,41 @@ void HueTemperatures::poll(bool simulation) {
                 while (!sensor.history.empty() && sensor.history.front().time < now - 3600.0)
                     sensor.history.pop_front();
         }
-        for (int i = 0; i < 300 && !stopping; ++i)
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        std::unique_lock lock(mutex);
+        while (!stopping) {
+            wake.wait_until(lock, deadline, [&] { return stopping || !commandId.empty(); });
+            if (stopping) break;
+            if (commandId.empty()) break;
+            const auto id = commandId;
+            const auto on = commandOn;
+            const double brightness = commandBrightness;
+            commandId.clear();
+            lock.unlock();
+            std::string error;
+            try {
+                if (!simulation) {
+                    json payload;
+                    if (on.has_value()) payload = {{"on", {{"on", *on}}}};
+                    else payload = {{"dimming", {{"brightness", brightness}}}};
+                    const auto updated = request("light/" + id, payload.dump());
+                    if (std::none_of(updated.begin(), updated.end(), [&](const auto &item) {
+                        return item.value("rid", std::string{}) == id;
+                    })) throw HueRequestError("bridge did not acknowledge this light");
+                }
+            } catch (const HueRequestError &failure) { error = failure.what(); }
+            catch (...) { error = "invalid bridge response"; }
+            lock.lock();
+            if (error.empty()) {
+                for (auto &light : state.lights) if (light.id == id) {
+                    if (on.has_value()) light.on = *on;
+                    else light.brightness = brightness;
+                }
+                state.lightActionStatus = simulation ? "Simulated light changed" : "Light changed";
+            } else state.lightActionStatus = "Could not change light: " + error;
+            state.pendingLight.clear();
+            if (std::chrono::steady_clock::now() >= deadline) break;
+        }
     }
     if (headers) curl_slist_free_all(headers);
     if (curl) curl_easy_cleanup(curl);

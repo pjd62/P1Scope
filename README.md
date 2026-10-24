@@ -6,21 +6,24 @@ A Linux energy monitor for a HomeWizard P1 meter, with a C++20 desktop dashboard
 
 A simulation mode lets you use the dashboard without a meter or network connection.
 
-![P1Scope dashboard with electricity, gas usage, room temperatures, and phase groups](docs/dashboard.png)
+![P1Scope desktop dashboard with the Hue lights popup, electricity, gas usage, room temperatures, and phase groups](docs/dashboard.png)
 
-*Desktop dashboard example with simulated readings and 30 minutes of generated history; the plots show the selected 10-minute window.*
+*Desktop dashboard with Hue lights grouped by room, green (on) and red (off) toggle buttons, brightness sliders, and the option to reveal unavailable lights. Temperature readings sit below the gas and temperature plot; the Hue lights button sits beside its visibility checkbox. All readings are simulated, with 30 minutes of generated history and a selected 10-minute view.*
 
 ## Features
 
 - Headless LAN server: view the dashboard from Windows, Android, or any modern browser.
 - Live grid import/export and the meter's active tariff.
 - Separate power curves for Grid (yellow), L1 (blue), L2 (orange), and L3 (green).
-- Phase cards showing power, voltage, and measured current relative to 25 A.
+- Optional phase cards showing power, voltage, and measured current relative to 25 A.
+  Use **Phase cards** above the cards to show or hide them (shown by default).
+  In both dashboards, the grid power plot expands into the space freed by hidden
+  gas/temperature plots and phase cards.
 - Selectable 1-, 5-, 10-, and 30-minute views plus a 1-hour view, with automatic Y-axis scaling.
 - Crosshairs and a shared tooltip showing the nearest sample's time and all four power values.
 - Optional gas usage plot in m³, with the total gas meter reading and its reported timestamp.
 - Philips Hue room temperatures alongside gas usage, with a separate °C axis, matching readout colors, and hover details.
-- Hue bridge pairing through `hue_temperatures.py --pair`, background polling every 30 seconds, and connection status.
+- Hue bridge pairing through `hue_temperatures.py --pair`, background polling every 30 seconds, and connection diagnostics on stderr.
 - Optional dashed reference lines at ±5,750 W per phase.
 - Meter Wi-Fi name, signal strength, and connection status.
 - Stale-data indication and gaps for failed requests or measurement intervals longer than three seconds.
@@ -105,6 +108,11 @@ Connect to the real meter:
 ./build/p1scope
 ```
 
+The desktop window opens at 1400 × 1000 pixels so the plots, temperature readings,
+and phase cards fit together. The window remains resizable. Connection and Wi-Fi status share the top-right
+header line; tariff and grid import/export share a line, with tariff first, directly
+above the gas readouts.
+
 Run with simulated data:
 
 ```bash
@@ -180,6 +188,10 @@ On another device on the same network, open `http://SERVER-IP:8080` (replace
 ./build-server/p1scope-server --bind 0.0.0.0 --port 8080
 ```
 
+On startup, the server prints timestamped **Web dashboard URL** messages to stderr.
+When bound to `0.0.0.0`, these include localhost and each active LAN IPv4 address.
+Use a LAN address when connecting from another device.
+
 The default bind address is `127.0.0.1`, which only permits access from the server
 itself. `--bind 0.0.0.0` enables access through all IPv4 interfaces. Allow TCP port
 8080 through the server's firewall for your LAN if necessary. This HTTP dashboard
@@ -201,7 +213,7 @@ For Hue, copy your existing `.hue-credentials.json` securely to the server's
 project directory or run `python3 hue_temperatures.py --pair` there. The account
 running the server must own and be able to read this file; keep its permissions
 at `600`. Restart after changing Hue credentials. Without Hue, the gas and
-electricity views continue to work and the dashboard shows the Hue status.
+electricity views continue to work; Hue diagnostics are logged to stderr.
 
 The server needs local network discovery access to the P1 meter through Avahi,
 and HTTPS access to the paired Hue bridge. Separate VLANs may require mDNS
@@ -252,10 +264,10 @@ as a local file will not connect it to the meters. No browser extension or app
 installation is needed. The layout adapts to desktop and phone screens, with
 phase cards stacked vertically on narrow screens.
 
-The header shows grid import/export, the active tariff, gas used since server
-startup with elapsed time, the total gas reading and its update time, and P1/Hue
-connection status. Successful Hue connections include the bridge address and the
-number of temperature sensors found. Simulation is marked in the header and gas
+The header shows P1 connection status, Wi-Fi network name, and signal strength.
+Tariff and grid import/export appear below the power plot. Gas used since server
+startup, elapsed time, and the total gas reading with its update time appear below
+the gas and temperature plot. Hue bridge connection details are logged to stderr. Simulation is marked in the header and gas
 readouts; simulated temperature sensors are named accordingly.
 
 ### Browser controls
@@ -265,7 +277,7 @@ readouts; simulated temperature sensors are named accordingly.
 | **History** | Select 1, 5, 10, or 30 minutes, or 1 hour. Both plots use the same selection; the web default is 1 hour. |
 | **25 A reference** | Show dashed ±5,750 W references per phase. Off by default. |
 | **Gas & temperatures** | Show or hide the combined plot. Gas uses the left axis in m³; room temperatures use the right axis in °C. |
-| **Gas trend** | Show or hide the dotted yellow linear trendline. On by default. The hover details include its estimated rate in m³/hour. |
+| **Gas trend** legend entry | Show or hide the dotted yellow linear trendline. On by default. The hover details include its estimated rate in m³/hour. |
 | **Legend** | Click a label in the top-right legend to toggle that curve and its tooltip entry. |
 | **Hover / tap** | Move over a plot for shared time and reading details. Tap or click to pin the details; tap or click again to release them. Missing readings are marked unavailable. |
 | **Reload groups** | Reread the server's `groups.json` without restarting. Invalid changes retain the last valid configuration. |
@@ -391,7 +403,8 @@ continues without assignments.
 
 ## Gas usage
 
-The **Gas & temperatures** checkbox shows a combined plot below electricity, using the same
+The **Gas & temperatures** checkbox sits just above the combined plot and shows
+the plot below electricity, using the same
 history selection. It plots the increase in `total_gas_m3` since the first available
 reading in the visible window, in m³. Changing the window or scrolling history
 changes that baseline. This is observed usage within the retained history, not a
@@ -421,18 +434,41 @@ can include heating from earlier in the reporting interval; the trendline may
 remain positive while the burner is off because it fits the visible history.
 This model applies only to simulation; live readings are displayed as reported.
 
-The **Gas trend** checkbox (on by default) overlays a linear least-squares fit of
-valid gas readings in the visible window. Its estimated slope in m³/hour appears
+The **Gas trend** line (visible by default) overlays a linear least-squares fit of
+valid gas readings in the visible window. Click its legend entry to show or hide it.
+Its estimated slope in m³/hour appears
 in the hover tooltip. Missing-data intervals remain gaps in the trendline. The fit
 needs at least two readings at different times. Since gas updates roughly every
 five minutes, short windows can show a flat or unrepresentative trend; this is an
 estimate over received readings, not instantaneous gas flow.
 
+## Hue lights popup
+
+Click **Hue lights** in the desktop or web dashboard to list all lights on the
+paired bridge, grouped by their Hue room, with their names, on/off states, and reported brightness (where
+supported). Rooms and lights are sorted by name; lights without a room appear under
+**Unassigned** at the end. Close the popup with **Close**, Escape, or the desktop close icon.
+The list refreshes every 30 seconds using the existing Hue credentials. Failed
+requests show an unavailable status and label any retained list as last known.
+Unreachable lights are hidden by default. Enable **Show unavailable lights** to
+reveal them; their controls are disabled. Availability is read from the bridge
+every 30 seconds; switched-off lights that remain reachable stay visible.
+
+Use **Turn on** or **Turn off** to change a light. The adjacent **Brightness**
+slider adjusts dimmable lights from 0–100% when released; changing brightness
+leaves the on/off state unchanged. Lights without dimming show **Unavailable**. Controls are disabled while a
+change is pending or the bridge is unavailable. The popup reports success or
+failure; the displayed state changes after the bridge acknowledges the request.
+Simulation provides three example lights whose states can be changed without
+contacting the bridge.
+
 ## Hue temperatures in the gas plot
 
 Room temperature curves share the gas plot's time axis and history selection.
 Gas uses the left axis (m³); temperature uses the right axis (°C). Current sensor
-readings and Hue connection status appear above the plot. Use the legend to toggle
+readings appear below the plot. The **Hue lights** button sits beside the
+**Gas & temperatures** checkbox and remains available when the plot is hidden. Hue bridge
+connection diagnostics are printed to stderr. Use the legend to toggle
 individual series. Hover over the combined plot for the cursor time, gas usage,
 total gas meter reading, and each sensor's nearest temperature and sample time.
 Missing readings and times outside a series' history are marked unavailable.
@@ -441,7 +477,7 @@ for one hour; readings are timestamped when received.
 
 The application connects to the bridge address saved during pairing; it does not
 perform Hue mDNS discovery at each startup. A successful connection is reported
-in the dashboard and timestamped stderr logs with the bridge IP and number of
+in timestamped stderr logs with the bridge IP and number of
 temperature sensors found. Logs also list sensor names and report failures and
 recovery when the connection status changes. API keys are never logged.
 

@@ -69,3 +69,11 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# Local CLion project settings and build directories
+.idea/
+cmake-build-*/
+
+# Local credentials and UI layout
+.hue-credentials.json
+imgui.ini

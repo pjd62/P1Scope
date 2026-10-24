@@ -8,4 +8,5 @@ int serveDashboard(const std::string &bindAddress, unsigned short port,
     const std::string &webRoot, std::atomic<bool> &running,
     const std::function<bool()> &stopRequested,
     const std::function<std::string()> &snapshot,
-    const std::function<std::string()> &reloadGroups);
+    const std::function<std::string()> &reloadGroups,
+    const std::function<std::string(const std::string &, const std::string &)> &setLight);
