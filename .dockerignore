@@ -1,0 +1,8 @@
+# Allow only the headless build inputs and web assets into the build context.
+**
+!CMakeLists.txt
+!main.cpp
+!*.cxx
+!*.hxx
+!web/
+!web/**

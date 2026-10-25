@@ -1,0 +1,36 @@
+services:
+  p1scope:
+    build: .
+    image: p1scope:local
+    restart: unless-stopped
+    # Linux host networking permits LAN access and uses the host's Avahi service.
+    network_mode: host
+    user: "${P1SCOPE_UID:-1000}:${P1SCOPE_GID:-1000}"
+    environment:
+      TZ: "${TZ:-Europe/Amsterdam}"
+      P1SCOPE_PORT: "${P1SCOPE_PORT:-8080}"
+      DBUS_SYSTEM_BUS_ADDRESS: unix:path=/run/dbus/system_bus_socket
+    command: ["--bind", "0.0.0.0", "--port", "${P1SCOPE_PORT:-8080}"]
+    volumes:
+      - type: bind
+        source: ./groups.json
+        target: /app/groups.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /run/dbus/system_bus_socket
+        target: /run/dbus/system_bus_socket
+        read_only: true
+        bind:
+          create_host_path: false
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent --max-time 3 http://127.0.0.1:$${P1SCOPE_PORT}/api/state > /dev/null"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    stop_grace_period: 15s

@@ -77,3 +77,6 @@ cmake-build-*/
 # Local credentials and UI layout
 .hue-credentials.json
 imgui.ini
+
+# Local Docker Compose settings
+.env

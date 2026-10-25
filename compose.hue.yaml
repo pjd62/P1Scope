@@ -1,0 +1,10 @@
+# Optional overlay: docker compose -f compose.yaml -f compose.hue.yaml up -d --build
+services:
+  p1scope:
+    volumes:
+      - type: bind
+        source: ./.hue-credentials.json
+        target: /app/.hue-credentials.json
+        read_only: true
+        bind:
+          create_host_path: false

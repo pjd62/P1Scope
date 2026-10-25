@@ -225,6 +225,124 @@ the server's memory, shared by all clients. Reloading a browser keeps that histo
 restarting the server clears it and the gas-session baseline. Browser view options
 are remembered locally. Connection failures are marked stale or unavailable.
 
+### Run with Docker Compose (Linux)
+
+The included `Dockerfile` builds the headless server; `compose.yaml` builds and
+runs it with the web dashboard. Use Docker Engine and the Docker Compose plugin
+on a Linux host (including a Raspberry Pi with 64-bit Linux). This setup uses
+host networking and the host's Avahi service through its system D-Bus socket.
+Docker Desktop on Windows/macOS is not supported by this configuration.
+
+The Docker build happens on whichever host runs `docker compose up --build`.
+For your **remote HP t620**, follow the remote deployment steps below; nothing
+needs to run on your development machine after deployment.
+
+#### Run from a Git checkout on the HP t620
+
+Run the following steps **on the HP t620**, using its Linux installation on the
+same LAN as the P1 meter and Hue bridge. Install Docker Engine and the Docker
+Compose plugin, with Docker access for your user. Check with `docker version`
+and `docker compose version`. Enable Avahi on the t620 host (Debian/Ubuntu):
+
+```bash
+sudo apt install avahi-daemon dbus git
+sudo systemctl enable --now avahi-daemon
+```
+
+Check out the project there, or enter your existing checkout:
+
+```bash
+git clone https://github.com/pjd62/P1Scope.git
+cd P1Scope
+# Run once to match the container user to your local configuration-file owner:
+printf 'P1SCOPE_UID=%s\nP1SCOPE_GID=%s\n' "$(id -u)" "$(id -g)" > .env
+docker compose up -d --build
+docker compose logs -f
+```
+
+Docker compiles the application and runs the headless web dashboard on the t620.
+No C++ compiler or CMake needs installing on the host. The first build needs
+internet access to download the base image, build tools, and packages. Open
+`http://T620-IP:8080` from your laptop or phone; startup logs list usable URLs.
+The container continues running after you disconnect SSH and restarts after the
+t620 reboots, provided its Docker service starts at boot. `Ctrl+C` exits log-following
+without stopping the detached container.
+
+For Hue, `.hue-credentials.json` is deliberately not in Git. Copy your existing
+paired file securely into the checkout, or pair directly on the t620:
+
+```bash
+sudo apt install python3
+python3 hue_temperatures.py --pair
+chmod 600 .hue-credentials.json
+docker compose -f compose.yaml -f compose.hue.yaml up -d --build
+```
+
+Edit `groups.json` to match your wiring. For updates, run these commands in the
+t620 checkout after preserving any local changes to tracked files:
+
+```bash
+git pull
+docker compose up -d --build
+```
+
+Include `-f compose.yaml -f compose.hue.yaml` in Compose commands when using Hue.
+Local `.env` settings and Hue credentials are ignored by Git. Run
+`docker compose down` to stop the service. All build and run commands execute on
+the t620; no Docker service is needed on your development machine.
+
+#### Run directly on the current Linux host
+
+From the project directory, ensure Avahi is running on the **host**:
+
+```bash
+sudo apt install avahi-daemon dbus
+sudo systemctl enable --now avahi-daemon
+# Match the container user to your local configuration-file owner:
+export P1SCOPE_UID=$(id -u) P1SCOPE_GID=$(id -g)
+docker compose up -d --build
+docker compose logs -f
+```
+
+Open `http://SERVER-IP:8080`; startup logs list usable dashboard URLs. Host
+networking needs no `ports:` mapping. Stop any existing P1Scope server on the
+same port first, or select another port with `export P1SCOPE_PORT=8081` before
+starting Compose. The dashboard remains intended for a trusted LAN.
+
+`groups.json` is mounted read-only. Edit it on the host and click **Reload
+groups**. If your editor replaces the file rather than updating it in place,
+recreate the container with `docker compose up -d --force-recreate` to refresh
+the file mount. The container runs as UID/GID 1000 by default; the exports above
+override these to match your account. Set `TZ` before starting Compose to change
+the default `Europe/Amsterdam` timezone.
+
+For **Hue**, pair on the host first, or use your existing `.hue-credentials.json`:
+
+```bash
+python3 hue_temperatures.py --pair  # Only if not already paired
+chmod 600 .hue-credentials.json
+docker compose -f compose.yaml -f compose.hue.yaml up -d --build
+```
+
+The optional overlay mounts credentials read-only and fails if the file is
+missing. Keep the UID/GID exports when using it so the container can read the
+owner-only file. Credentials, Git history, IDE files, and local builds are excluded
+from the image build context. Use the same `-f` options for subsequent Compose
+commands when the Hue overlay is enabled.
+
+To try **simulation**, run the image in the foreground (the host D-Bus mount is
+still required by this Compose file, but simulated readings do not use it):
+
+```bash
+docker compose run --rm --no-deps p1scope --simulation --bind 0.0.0.0 --port 8080
+```
+
+Stop the normal container first with `docker compose down` to free the port.
+Ctrl+C stops simulation. Return to live mode with `docker compose up -d`.
+The health check verifies HTTP availability; it does not guarantee fresh meter
+readings. History is held in memory and resets on container restart. After source
+changes, run `docker compose up -d --build` to rebuild the image.
+
 ### Start automatically with systemd
 
 An example service is provided in `deploy/p1scope.service`. It assumes the project
@@ -546,6 +664,8 @@ Confirm the CMake and GLFW minimum versions above. If CMake fails with a Snap/Ap
 | `HttpServer.hxx` / `.cxx` | LAN HTTP server, static assets, and API routing. |
 | `web/` | Responsive web dashboard and bundled D3 chart library. |
 | `deploy/p1scope.service` | Example systemd service for a Linux server. |
+| `Dockerfile` / `.dockerignore` | Headless container image and restricted build context. |
+| `compose.yaml` / `compose.hue.yaml` | Linux Docker Compose setup and optional Hue credentials mount. |
 | `tests/server_smoke.py` | Headless HTTP integration checks. |
 | `P1.json` | Example meter response. |
 | `external/imgui` | Dear ImGui sources and GLFW/OpenGL backends. |
