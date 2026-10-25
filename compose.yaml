@@ -3,24 +3,18 @@ services:
     build: .
     image: p1scope:local
     restart: unless-stopped
-    # Linux host networking permits LAN access and uses the host's Avahi service.
+    # Linux host networking permits direct LAN access to the meter and bridge.
     network_mode: host
     user: "${P1SCOPE_UID:-1000}:${P1SCOPE_GID:-1000}"
     environment:
       TZ: "${TZ:-Europe/Amsterdam}"
       P1SCOPE_PORT: "${P1SCOPE_PORT:-8080}"
-      DBUS_SYSTEM_BUS_ADDRESS: unix:path=/run/dbus/system_bus_socket
+      P1SCOPE_METER_ADDRESS: "${P1SCOPE_METER_ADDRESS:-}"
     command: ["--bind", "0.0.0.0", "--port", "${P1SCOPE_PORT:-8080}"]
     volumes:
       - type: bind
         source: ./groups.json
         target: /app/groups.json
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: /run/dbus/system_bus_socket
-        target: /run/dbus/system_bus_socket
         read_only: true
         bind:
           create_host_path: false

@@ -130,6 +130,7 @@ Print the simulated JSON reports as well:
 | `--simulation` / `--simulated` | `-s` | Generate local P1 reports without Avahi discovery or HTTP requests. |
 | `--report` | `-v` | Print each successful live or simulated JSON report to stdout. |
 | `--config PATH` | | Load group assignments from another JSON file. |
+| `--meter-address IPv4[:PORT]` | | Connect directly to the meter, skipping Avahi discovery; default meter port 80. Also configurable with `P1SCOPE_METER_ADDRESS`. |
 | `--server` | | Run the desktop executable as a headless HTTP server instead of opening a window. The `p1scope-server` executable always uses server mode. |
 | `--bind ADDRESS` | | IPv4 address to listen on in server mode; default `127.0.0.1`. Use `0.0.0.0` for LAN access. |
 | `--port PORT` | | HTTP port in server mode; default `8080`. |
@@ -230,7 +231,8 @@ are remembered locally. Connection failures are marked stale or unavailable.
 The included `Dockerfile` builds the headless server; `compose.yaml` builds and
 runs it with the web dashboard. Use Docker Engine and the Docker Compose plugin
 on a Linux host (including a Raspberry Pi with 64-bit Linux). This setup uses
-host networking and the host's Avahi service through its system D-Bus socket.
+host networking and a configured meter IP address, without accessing the host
+D-Bus socket. Automatic Avahi discovery is an optional overlay.
 Docker Desktop on Windows/macOS is not supported by this configuration.
 
 The Docker build happens on whichever host runs `docker compose up --build`.
@@ -242,12 +244,7 @@ needs to run on your development machine after deployment.
 Run the following steps **on the HP t620**, using its Linux installation on the
 same LAN as the P1 meter and Hue bridge. Install Docker Engine and the Docker
 Compose plugin, with Docker access for your user. Check with `docker version`
-and `docker compose version`. Enable Avahi on the t620 host (Debian/Ubuntu):
-
-```bash
-sudo apt install avahi-daemon dbus git
-sudo systemctl enable --now avahi-daemon
-```
+and `docker compose version`. You also need Git on the host.
 
 Check out the project there, or enter your existing checkout:
 
@@ -256,6 +253,8 @@ git clone https://github.com/pjd62/P1Scope.git
 cd P1Scope
 # Run once to match the container user to your local configuration-file owner:
 printf 'P1SCOPE_UID=%s\nP1SCOPE_GID=%s\n' "$(id -u)" "$(id -g)" > .env
+# Replace this example with your P1 meter IP (not the t620 or Hue bridge):
+printf 'P1SCOPE_METER_ADDRESS=192.168.0.73\n' >> .env
 docker compose up -d --build
 docker compose logs -f
 ```
@@ -293,11 +292,10 @@ the t620; no Docker service is needed on your development machine.
 
 #### Run directly on the current Linux host
 
-From the project directory, ensure Avahi is running on the **host**:
+From the project directory, set the P1 meter address:
 
 ```bash
-sudo apt install avahi-daemon dbus
-sudo systemctl enable --now avahi-daemon
+export P1SCOPE_METER_ADDRESS=192.168.0.73  # Replace with your meter IP
 # Match the container user to your local configuration-file owner:
 export P1SCOPE_UID=$(id -u) P1SCOPE_GID=$(id -g)
 docker compose up -d --build
@@ -330,8 +328,8 @@ owner-only file. Credentials, Git history, IDE files, and local builds are exclu
 from the image build context. Use the same `-f` options for subsequent Compose
 commands when the Hue overlay is enabled.
 
-To try **simulation**, run the image in the foreground (the host D-Bus mount is
-still required by this Compose file, but simulated readings do not use it):
+To try **simulation**, run the image in the foreground (no meter or D-Bus access
+is required):
 
 ```bash
 docker compose run --rm --no-deps p1scope --simulation --bind 0.0.0.0 --port 8080
@@ -342,6 +340,35 @@ Ctrl+C stops simulation. Return to live mode with `docker compose up -d`.
 The health check verifies HTTP availability; it does not guarantee fresh meter
 readings. History is held in memory and resets on container restart. After source
 changes, run `docker compose up -d --build` to rebuild the image.
+
+#### Avahi access denied in Docker
+
+If a container reports `Could not create Avahi client: Access denied`, its host
+D-Bus access is being rejected. Rather than disabling security profiles or running
+as root, configure the meter address in `.env`:
+
+```text
+P1SCOPE_METER_ADDRESS=192.168.0.73
+```
+
+Use your meter's address. Recreate and rebuild the container, retaining the Hue
+overlay if enabled:
+
+```bash
+docker compose -f compose.yaml -f compose.hue.yaml up -d --build --force-recreate
+```
+
+Startup then logs `Avahi discovery skipped`. Direct connections default to port
+80; use `192.168.0.73:8081` for a meter on a different port. Reserve the meter's
+address in your router's DHCP settings, or update `.env` if it changes. Native
+executables can use `--meter-address 192.168.0.73` too.
+
+For automatic discovery, leave `P1SCOPE_METER_ADDRESS` empty and include
+`-f compose.avahi.yaml` in the Compose command. This overlay mounts the host's
+system D-Bus socket and requires host Avahi plus a host security policy allowing
+container access. A mounted socket alone does not guarantee access; direct-IP
+mode is recommended when this is denied. The default Compose setup does not
+mount D-Bus or change host security policy.
 
 ### Start automatically with systemd
 
@@ -665,8 +692,9 @@ Confirm the CMake and GLFW minimum versions above. If CMake fails with a Snap/Ap
 | `web/` | Responsive web dashboard and bundled D3 chart library. |
 | `deploy/p1scope.service` | Example systemd service for a Linux server. |
 | `Dockerfile` / `.dockerignore` | Headless container image and restricted build context. |
-| `compose.yaml` / `compose.hue.yaml` | Linux Docker Compose setup and optional Hue credentials mount. |
+| `compose.yaml` / `compose.hue.yaml` / `compose.avahi.yaml` | Linux Docker Compose setup, optional Hue credentials mount, and optional host Avahi access. |
 | `tests/server_smoke.py` | Headless HTTP integration checks. |
+| `tests/direct_meter.py` | Direct meter HTTP checks with Avahi unavailable, using a local mock meter. |
 | `P1.json` | Example meter response. |
 | `external/imgui` | Dear ImGui sources and GLFW/OpenGL backends. |
 | `external/implot` | ImPlot sources. |

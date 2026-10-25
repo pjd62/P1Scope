@@ -1,6 +1,8 @@
 #include "HomeWizardDiscovery.hxx"
 #include "HttpServer.hxx"
 #include <csignal>
+#include <cstdlib>
+#include <arpa/inet.h>
 #include "HueTemperatures.hxx"
 #include "HeatingSimulation.hxx"
 #include "Logging.hxx"
@@ -38,7 +40,8 @@ using json = nlohmann::ordered_json; // Prevent dump to reorder
 
 static bool printCompleteJson = false;
 static bool simulation = false;
-static string p1_ip_address = "";
+static std::string configuredMeterAddress;
+static unsigned short configuredMeterPort = 80;
 
 struct CircuitGroup {
     int number;
@@ -329,21 +332,28 @@ static json simulatedP1(std::mt19937 &random, size_t tick) {
 static void p1Thread() {
     HomeWizardDiscovery discovery;
     CURL *curl = nullptr;
+    std::string currentIp = configuredMeterAddress;
+    std::uint16_t currentPort = configuredMeterPort;
     if (simulation) {
         logStderr() << "Simulation enabled: generating P1 readings locally\n";
     } else {
-        if (!discovery.discover(running)) {
-            if (running.load())
-                logStderr() << "No HomeWizard P1 meter found\n";
-            running = false;
-            return;
+        if (currentIp.empty()) {
+            if (!discovery.discover(running)) {
+                if (running.load()) {
+                    logStderr() << "No HomeWizard P1 meter found; set --meter-address or P1SCOPE_METER_ADDRESS to connect directly\n";
+                }
+                running = false;
+                return;
+            }
+            currentIp = discovery.ip();
+            currentPort = discovery.port();
+            logStderr() << "HomeWizard P1 found: hostname=" << discovery.hostname()
+                        << " address=" << currentIp << " port=" << currentPort << '\n';
+        } else {
+            logStderr() << "HomeWizard P1: using configured address " << currentIp << ':' << currentPort
+                        << " (Avahi discovery skipped)\n";
         }
-
-
-        logStderr() << "HomeWizard P1 found: hostname=" << discovery.hostname()
-                    << " address=" << discovery.ip() << " port=" << discovery.port() << '\n';
-
-        curl = initCurl(discovery.ip(), discovery.port());
+        curl = initCurl(currentIp, currentPort);
         if (!curl) {
             logStderr() << "Failed to initialize cURL for the P1 meter\n";
             running = false;
@@ -359,8 +369,6 @@ static void p1Thread() {
     int retrySeconds = 1;
     bool recovering = false;
     auto lastErrorLog = std::chrono::steady_clock::time_point{};
-    const std::string currentIp = discovery.ip();
-    const std::uint16_t currentPort = discovery.port();
 
     while (running) {
         std::string error;
@@ -468,6 +476,8 @@ OPTIONS:
     --report, -v   : Print each live or simulated P1 JSON report
     --simulation, --simulated, -s : Generate random P1 reports once per second;
                     no meter, Avahi discovery or HTTP connection required
+    --meter-address IPv4[:PORT] : Connect directly to the meter, skipping Avahi;
+                    also settable with P1SCOPE_METER_ADDRESS (default port: 80)
     --server      : Serve the web dashboard without a graphical window
     --bind ADDRESS : HTTP IPv4 bind address (default: 127.0.0.1)
     --port PORT   : HTTP port (default: 8080)
@@ -1117,6 +1127,8 @@ int main(int argc, char **argv) {
     std::string bindAddress = "127.0.0.1";
     unsigned short httpPort = 8080;
     std::string webRoot = P1SCOPE_WEB_ROOT;
+    std::string meterEndpoint;
+    if (const char *value = std::getenv("P1SCOPE_METER_ADDRESS")) meterEndpoint = value;
 
     for (int i = 1; i < argc; ++i) {
         const std::string option = argv[i];
@@ -1130,6 +1142,10 @@ int main(int argc, char **argv) {
             simulation = true;
         else if (option == "--server")
             serverMode = true;
+        else if (option == "--meter-address") {
+            if (i + 1 >= argc) { logStderr() << option << " requires IPv4[:PORT]\n"; return 1; }
+            meterEndpoint = argv[++i];
+        }
         else if (option == "--bind" || option == "--port" || option == "--web-root") {
             if (i + 1 >= argc) { logStderr() << option << " requires a value\n"; return 1; }
             const std::string value = argv[++i];
@@ -1157,6 +1173,24 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (!meterEndpoint.empty()) {
+        const auto colon = meterEndpoint.find(':');
+        configuredMeterAddress = meterEndpoint.substr(0, colon);
+        in_addr address{};
+        if (inet_pton(AF_INET, configuredMeterAddress.c_str(), &address) != 1) {
+            logStderr() << "Invalid meter address: expected IPv4[:PORT]\n"; return 1;
+        }
+        if (colon != std::string::npos) {
+            const auto value = meterEndpoint.substr(colon + 1);
+            try {
+                if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos)
+                    throw std::invalid_argument("port");
+                const auto port = std::stoul(value);
+                if (port < 1 || port > 65535) throw std::out_of_range("port");
+                configuredMeterPort = static_cast<unsigned short>(port);
+            } catch (...) { logStderr() << "Invalid meter port: expected 1-65535\n"; return 1; }
+        }
+    }
     loadGroupsConfig();
 
     logStderr() << "P1Scope started\n";
