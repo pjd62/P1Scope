@@ -6,7 +6,7 @@ const assert=require('node:assert/strict');
 const now=1800000000;
 const samples=Array.from({length:361},(_,i)=>({t:now-3600+i*10,grid:500+Math.sin(i)*100,
     l1:200,l2:100,l3:200,gas:100+Math.floor(i/30)*.01,breakBefore:i===180}));
-const snapshot={now,started:now-3600,simulation:true,historySeconds:3600,
+const snapshot={now,started:now-3600,simulation:true,historySeconds:86400,
     measurement:{valid:true,requestFailed:false,updated:now,grid:500,phases:[200,100,200],
         voltage:[230,230,230],current:[1,1,1],gas:100.12,gasTimestamp:'October 21, 2026 20:40:00',tariff:'2',wifiSsid:'Home <WiFi>',wifiStrength:96},
     gasSession:{used:.12,meterDecreased:false},groupsError:'',
@@ -35,6 +35,7 @@ async function check(width){
     let reloads=0,fail=false,lightRequests=0,rejectLight=false;
     w.fetch=async url=>{
         if(fail)throw Error('Offline');
+        if(url === '/api/logs') return {ok:true,text:async()=> '[2026-10-27 12:00:00] <img src=x> diagnostic\n'};
         if(url.includes('/api/hue/lights/')) {
             lightRequests++;
             if(rejectLight)return {ok:true,json:async()=>({ok:false,error:'Bridge rejected change'})};
@@ -51,6 +52,13 @@ async function check(width){
     w.eval(fs.readFileSync('web/dashboard.js','utf8'));
     await new Promise(resolve=>setTimeout(resolve,30));
     const d=w.document;
+    d.querySelector('[data-logs-open]').click();
+    await new Promise(resolve=>setTimeout(resolve,30));
+    assert.equal(d.querySelector('.p-logs').open,true);
+    assert.match(d.querySelector('[data-logs-output]').textContent, /<img src=x> diagnostic/);
+    assert.equal(d.querySelectorAll('[data-logs-output] img').length,0);
+    d.querySelector('[data-logs-close]').click();
+    assert.equal(d.querySelector('.p-logs').open,false);
     d.querySelector('[data-lights-open]').click();
     assert.equal(d.querySelector('.p-lights').open,true);
     assert.equal(d.querySelectorAll('[data-lights-list] tr:not(.p-light-room)').length,2);
@@ -119,6 +127,12 @@ async function check(width){
     assert.equal(d.querySelectorAll('[data-heat-legend] button')[1].getAttribute('aria-pressed'),'false');
     const history=d.querySelector('select');history.value='5';history.dispatchEvent(new w.Event('change'));
     assert.equal(JSON.parse(w.localStorage.getItem('p1scope-view')).minutes,5);
+    for (const minutes of [360,1440]) {
+        history.value=String(minutes);history.dispatchEvent(new w.Event('change'));
+        assert.equal(JSON.parse(w.localStorage.getItem('p1scope-view')).minutes,minutes);
+        for(const path of d.querySelectorAll('path'))assert.ok(!/NaN|undefined/.test(path.getAttribute('d')||''));
+    }
+    history.value='5';history.dispatchEvent(new w.Event('change'));
     const legend=d.querySelector('[data-power-legend] button');legend.click();
     assert.equal(d.querySelector('[data-power-legend] button').getAttribute('aria-pressed'),'false');
     const overlay=d.querySelector('[data-heat] [data-chart-hit]');

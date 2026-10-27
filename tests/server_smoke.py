@@ -45,6 +45,14 @@ with tempfile.TemporaryDirectory(prefix='p1scope-http-test-') as tmp:
             if process.poll() is not None or time.monotonic() > deadline:
                 raise AssertionError('Server failed to become ready')
             time.sleep(.1)
+        log_status, log_headers, log_body = request('/api/logs')
+        assert log_status == 200
+        assert 'text/plain' in log_headers['Content-Type']
+        assert 'no-store' in log_headers['Cache-Control']
+        assert b'P1Scope started' in log_body
+        assert b'Simulation enabled' in log_body
+        assert b'Web dashboard URL:' in log_body
+        assert len(log_body) <= 256 * 1024
         assert state['hue']['lightsAvailable'] is True
         assert len(state['hue']['lights']) == 3
         assert len({light['roomId'] for light in state['hue']['lights']}) == 3
@@ -90,7 +98,12 @@ with tempfile.TemporaryDirectory(prefix='p1scope-http-test-') as tmp:
 
 
 
-        assert state['historySeconds'] == 3600 and state['samples']
+        assert state['historySeconds'] == 86400 and state['samples']
+        for minutes in [1, 60, 360, 1440]:
+            selected = json.loads(request(f'/api/state?minutes={minutes}')[2])
+            assert selected['historySeconds'] == 86400
+            assert all(row['t'] >= selected['now'] - minutes * 60 for row in selected['samples'])
+        assert request('/api/state?minutes=1441')[0] == 400
         assert len(state['measurement']['phases']) == 3
         assert len(state['hue']['sensors']) == 3
         assert state['hue']['sensors'][1]['history'][-1]['value'] >= 18

@@ -19,7 +19,7 @@ A simulation mode lets you use the dashboard without a meter or network connecti
   Use **Phase cards** above the cards to show or hide them (shown by default).
   In both dashboards, the grid power plot expands into the space freed by hidden
   gas/temperature plots and phase cards.
-- Selectable 1-, 5-, 10-, and 30-minute views plus a 1-hour view, with automatic Y-axis scaling.
+- Selectable 1-, 5-, 10-, and 30-minute views plus 1-, 6-, and 24-hour views, with automatic Y-axis scaling.
 - Crosshairs and a shared tooltip showing the nearest sample's time and all four power values.
 - Optional gas usage plot in m³, with the total gas meter reading and its reported timestamp.
 - Philips Hue room temperatures alongside gas usage, with a separate °C axis, matching readout colors, and hover details.
@@ -221,9 +221,10 @@ and HTTPS access to the paired Hue bridge. Separate VLANs may require mDNS
 forwarding. The existing three-phase meter requirement also applies to server mode.
 
 The browser refreshes data every two seconds; P1 polling remains approximately
-once per second and Hue polling every 30 seconds. One hour of history lives in
+once per second and Hue polling every 30 seconds. Up to 24 hours of history live in
 the server's memory, shared by all clients. Reloading a browser keeps that history;
-restarting the server clears it and the gas-session baseline. Browser view options
+restarting the server clears it and the gas-session baseline. Each browser requests
+only its selected time window to limit transfer size. Browser view options
 are remembered locally. Connection failures are marked stale or unavailable.
 
 ### Run with Docker Compose (Linux)
@@ -419,7 +420,7 @@ readouts; simulated temperature sensors are named accordingly.
 
 | Control | Behavior |
 | --- | --- |
-| **History** | Select 1, 5, 10, or 30 minutes, or 1 hour. Both plots use the same selection; the web default is 1 hour. |
+| **History** | Select 1, 5, 10, or 30 minutes, or 1, 6, or 24 hours. Both plots use the same selection; the web default is 1 hour. |
 | **25 A reference** | Show dashed ±5,750 W references per phase. Off by default. |
 | **Gas & temperatures** | Show or hide the combined plot. Gas uses the left axis in m³; room temperatures use the right axis in °C. |
 | **Gas trend** legend entry | Show or hide the dotted yellow linear trendline. On by default. The hover details include its estimated rate in m³/hour. |
@@ -435,7 +436,7 @@ is done in the server-side JSON file; the browser reload button applies changes.
 History selection, reference visibility, plot visibility, and legend choices are
 stored in each browser's local storage. Clients can choose different views while
 sharing the same server measurements. History starts collecting when the server
-starts; selecting 1 hour does not retrieve older data from the meters.
+starts; selecting a longer view does not retrieve older data from the meters.
 
 ### Status and troubleshooting
 
@@ -480,7 +481,7 @@ are rejected.
 
 ## Desktop dashboard controls
 
-- **History:** choose 1, 5, 10, or 30 minutes, or 1 hour. Up to one hour of data is retained in memory, so switching views does not discard the other samples.
+- **History:** choose 1, 5, 10, or 30 minutes, or 1, 6, or 24 hours. Up to 24 hours of data is retained in memory, so switching views does not discard the other samples.
 - **25 A reference:** show or hide the ±5,750 W reference lines (off by default). Hiding them allows the Y-axis to zoom in on smaller variations.
 - **Hover:** move over the plot to see the nearest sample's timestamp and power values. Missing-data intervals are identified rather than interpolated in the tooltip.
 - **Legend:** click a series' color icon to toggle its curve. Right-click the plot and open **Legend** to change its position or orientation. The default is the top-right corner.
@@ -587,6 +588,20 @@ needs at least two readings at different times. Since gas updates roughly every
 five minutes, short windows can show a flat or unrepresentative trend; this is an
 estimate over received readings, not instantaneous gas flow.
 
+## Web dashboard logs
+
+Click **Logs** in the web dashboard toolbar to open recent timestamped stderr
+application diagnostics. The popup refreshes every two seconds while open and
+follows new messages when scrolled to the bottom. Scroll up to read earlier
+messages; close with **Close** or Escape.
+
+The server retains up to 1,000 messages or 256 KiB in memory, dropping the oldest
+messages as needed; a single oversized message is truncated in this history.
+History resets on restart. Normal stderr output continues unchanged, including
+when redirected to a file or collected by Docker/systemd. This shows application
+logger messages, not arbitrary output from external processes or libraries.
+Logs are also available as plain text at `/api/logs` to dashboard clients.
+
 ## Hue lights popup
 
 Click **Hue lights** in the desktop or web dashboard to list all lights on the
@@ -618,7 +633,7 @@ individual series. Hover over the combined plot for the cursor time, gas usage,
 total gas meter reading, and each sensor's nearest temperature and sample time.
 Missing readings and times outside a series' history are marked unavailable.
 Temperature history is collected during this run and retained
-for one hour; readings are timestamped when received.
+for up to 24 hours; readings are timestamped when received.
 
 The application connects to the bridge address saved during pairing; it does not
 perform Hue mDNS discovery at each startup. A successful connection is reported

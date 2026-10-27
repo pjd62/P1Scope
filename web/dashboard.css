@@ -19,3 +19,5 @@ body{margin:0;background:#10151e} main{max-width:1600px;margin:auto}
 #p1scope-web button.p-button{background:#315b85;color:#fff;border:1px solid #4b7196;border-radius:4px;padding:5px 12px;cursor:pointer}#p1scope-web button.p-button:hover{background:#3e6e9e}#p1scope-web button.p-button:active{background:#264767}
 
 #p1scope-web .p-connection{display:flex;align-items:center;justify-content:flex-end;gap:10px;flex-wrap:wrap}#p1scope-web .p-plot-readouts{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding-top:8px}#p1scope-web .p-gas-readouts{padding:8px 0;font-variant-numeric:tabular-nums}
+
+#p1scope-web .p-logs{width:min(960px,calc(100% - 28px))}#p1scope-web .p-logs-output{height:50vh;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.6 monospace;background:var(--p-control);padding:12px;border-radius:6px}

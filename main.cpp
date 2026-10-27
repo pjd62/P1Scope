@@ -5,6 +5,7 @@
 #include <arpa/inet.h>
 #include "HueTemperatures.hxx"
 #include "HeatingSimulation.hxx"
+#include "History.hxx"
 #include "Logging.hxx"
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
@@ -103,7 +104,6 @@ struct Sample {
 static std::deque<Sample> samples;
 static std::mutex samplesMutex;
 static std::atomic<bool> running{true};
-constexpr double HISTORY_SECONDS = 3600.0;
 constexpr double MAIN_FUSE_CURRENT_A = 25.0;
 constexpr double NOMINAL_PHASE_VOLTAGE_V = 230.0;
 // Per-phase active-power reference at unity power factor, not a fuse trip threshold.
@@ -581,11 +581,11 @@ static void drawDashboard(const HueSnapshot &hue, HueTemperatures *controller = 
             ImGui::TextWrapped("Unassigned: %d - %s", group.number, group.name.c_str());
     }
     static int timeRange = 2;
-    const double durations[] = {60.0, 300.0, 600.0, 1800.0, 3600.0};
+    const double durations[] = {60.0, 300.0, 600.0, 1800.0, 3600.0, 21600.0, HISTORY_SECONDS};
     ImGui::TextUnformatted("History");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(110.0f);
-    ImGui::Combo("##History", &timeRange, "1 minute\0" "5 minutes\0" "10 minutes\0" "30 minutes\0" "1 hour\0");
+    ImGui::Combo("##History", &timeRange, "1 minute\0" "5 minutes\0" "10 minutes\0" "30 minutes\0" "1 hour\0" "6 hours\0" "24 hours\0");
     ImGui::SameLine();
     ImGui::Checkbox("25 A reference", &showReference);
     if (ImGui::IsItemHovered())
@@ -1069,7 +1069,7 @@ static void drawDashboard(const HueSnapshot &hue, HueTemperatures *controller = 
 static volatile std::sig_atomic_t serverStopRequested = 0;
 static void stopServer(int) { serverStopRequested = 1; }
 
-static json serverSnapshot(HueTemperatures &hue) {
+static json serverSnapshot(HueTemperatures &hue, double windowSeconds) {
     const auto temperatures = hue.snapshot();
     json result = {{"simulation", simulation}, {"now", plotTime()},
         {"started", std::chrono::duration<double>(programStarted.time_since_epoch()).count()},
@@ -1097,7 +1097,7 @@ static json serverSnapshot(HueTemperatures &hue) {
             finite(gasSession.latestTotal - gasSession.firstTotal) : json(nullptr)},
             {"meterDecreased", gasSession.meterDecreased}};
         for (const auto &sample : samples) {
-            if (sample.time < result["now"].get<double>() - HISTORY_SECONDS) continue;
+            if (sample.time < result["now"].get<double>() - windowSeconds) continue;
             result["samples"].push_back({{"t", sample.time}, {"grid", sample.active_power_w},
                 {"l1", sample.active_power_l_w[0]}, {"l2", sample.active_power_l_w[1]},
                 {"l3", sample.active_power_l_w[2]}, {"gas", finite(sample.totalGasM3)},
@@ -1110,8 +1110,10 @@ static json serverSnapshot(HueTemperatures &hue) {
             {"on", light.on}, {"brightness", light.brightness >= 0 ? json(light.brightness) : json(nullptr)}});
     for (const auto &sensor : temperatures.sensors) {
         json history = json::array();
-        for (const auto &point : sensor.history)
+        for (const auto &point : sensor.history) {
+            if (point.time < result["now"].get<double>() - windowSeconds) continue;
             history.push_back({{"t", point.time}, {"value", std::isfinite(point.celsius) ? json(point.celsius) : json(nullptr)}});
+        }
         result["hue"]["sensors"].push_back({{"id", sensor.id}, {"name", sensor.name}, {"history", history}});
     }
     return result;
@@ -1210,7 +1212,7 @@ int main(int argc, char **argv) {
         std::signal(SIGTERM, stopServer);
         const int result = serveDashboard(bindAddress, httpPort, webRoot, running,
             [] { return serverStopRequested != 0; },
-            [&] { return serverSnapshot(hue).dump(); },
+            [&](double seconds) { return serverSnapshot(hue, seconds).dump(); },
             [] { const bool ok = loadGroupsConfig(); return json{{"ok", ok}, {"error", groupsConfigError}}.dump(); },
             [&](const std::string &id, const std::string &action) {
                 const auto error = action.starts_with("brightness-") ? hue.setBrightness(id, std::stoi(action.substr(11))) :

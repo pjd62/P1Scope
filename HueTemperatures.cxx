@@ -1,4 +1,5 @@
 #include "HueTemperatures.hxx"
+#include "History.hxx"
 #include "HeatingSimulation.hxx"
 #include "Logging.hxx"
 #include <curl/curl.h>
@@ -258,7 +259,7 @@ void HueTemperatures::poll(bool simulation) {
                 }
             }
             for (auto &sensor : state.sensors)
-                while (!sensor.history.empty() && sensor.history.front().time < now - 3600.0)
+                while (!sensor.history.empty() && sensor.history.front().time < now - HISTORY_SECONDS)
                     sensor.history.pop_front();
         }
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);

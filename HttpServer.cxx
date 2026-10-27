@@ -1,5 +1,6 @@
 #include "HttpServer.hxx"
 #include "Logging.hxx"
+#include "History.hxx"
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <ifaddrs.h>
@@ -40,7 +41,7 @@ void respond(int fd, const char *status, const char *type, const std::string &bo
 int serveDashboard(const std::string &bindAddress, unsigned short port,
     const std::string &webRoot, std::atomic<bool> &running,
     const std::function<bool()> &stopRequested,
-    const std::function<std::string()> &snapshot,
+    const std::function<std::string(double)> &snapshot,
     const std::function<std::string()> &reloadGroups,
     const std::function<std::string(const std::string &, const std::string &)> &setLight) {
     Socket listener{socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)};
@@ -105,7 +106,15 @@ int serveDashboard(const std::string &bindAddress, unsigned short port,
         std::string method, path, protocol;
         input >> method >> path >> protocol;
         if (method == "GET" && path == "/api/state") {
-            respond(client.fd, "200 OK", "application/json", snapshot());
+            respond(client.fd, "200 OK", "application/json", snapshot(HISTORY_SECONDS));
+        } else if (method == "GET" && path.starts_with("/api/state?minutes=")) {
+            const auto minutes = path.substr(std::string("/api/state?minutes=").size());
+            const std::set<std::string> ranges = {"1", "5", "10", "30", "60", "360", "1440"};
+            if (!ranges.contains(minutes))
+                respond(client.fd, "400 Bad Request", "text/plain", "Invalid history range");
+            else respond(client.fd, "200 OK", "application/json", snapshot(std::stod(minutes) * 60.0));
+        } else if (method == "GET" && path == "/api/logs") {
+            respond(client.fd, "200 OK", "text/plain; charset=utf-8", recentStderr());
         } else if (method == "POST" && path == "/api/groups/reload") {
             // A custom header prevents cross-origin form submissions; no CORS is enabled.
             std::string lower = request;

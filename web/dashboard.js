@@ -5,7 +5,7 @@ const $ = selector => root.querySelector(selector);
 let snapshot = null;
 let stored = {};
 try { stored = JSON.parse(localStorage.getItem('p1scope-view') || '{}'); } catch (_) {}
-const state = {minutes: [1,5,10,30,60].includes(stored.minutes) ? stored.minutes : 60,
+const state = {minutes: [1,5,10,30,60,360,1440].includes(stored.minutes) ? stored.minutes : 60,
     reference: !!stored.reference, hybrid: stored.hybrid !== false, 'phase-cards': stored['phase-cards'] !== false,
     hidden: new Set(Array.isArray(stored.hidden) ? stored.hidden : [])};
 const colors = {grid:'--p-gridline', l1:'--p-l1', l2:'--p-l2', l3:'--p-l3', gas:'--p-gas', trend:'--p-trend'};
@@ -44,6 +44,36 @@ function legend(selector, series) {
         box.append(button);
     }
 }
+const logsDialog = $('.p-logs'), logsOutput = $('[data-logs-output]');
+let logsTimer, logsLoading = false, logsFirst = true;
+async function pollLogs() {
+    if (!logsDialog.open || logsLoading) return;
+    logsLoading = true;
+    try {
+        const response = await fetch('/api/logs', {cache:'no-store', signal:AbortSignal.timeout(8000)});
+        if (!response.ok) throw Error('HTTP ' + response.status);
+        const text = await response.text();
+        const atBottom = logsFirst || logsOutput.scrollTop + logsOutput.clientHeight >= logsOutput.scrollHeight - 24;
+        logsOutput.textContent = text || 'No diagnostics yet.';
+        if (atBottom) logsOutput.scrollTop = logsOutput.scrollHeight;
+        logsFirst = false;
+        $('[data-logs-status]').textContent = 'Live · Refreshing every 2 seconds';
+    } catch (_) {
+        $('[data-logs-status]').textContent = 'Could not refresh logs. Retrying…';
+    } finally {
+        logsLoading = false;
+        clearTimeout(logsTimer);
+        if (logsDialog.open) logsTimer = setTimeout(pollLogs, 2000);
+    }
+}
+$('[data-logs-open]').addEventListener('click', () => {
+    logsDialog.showModal();
+    logsFirst = true;
+    $('[data-logs-status]').textContent = 'Loading…';
+    pollLogs();
+});
+$('[data-logs-close]').addEventListener('click', () => logsDialog.close());
+logsDialog.addEventListener('close', () => clearTimeout(logsTimer));
 const lightsDialog = $('.p-lights');
 $('[data-lights-open]').addEventListener('click', () => lightsDialog.showModal());
 $('[data-lights-close]').addEventListener('click', () => lightsDialog.close());
@@ -231,13 +261,13 @@ function render() {
     }
     tip.hidden=true;
 }
-$('select').addEventListener('change',event=>{state.minutes=+event.target.value;persist();render();});
+$('select').addEventListener('change',event=>{state.minutes=+event.target.value;persist();render();poll();});
 for(const key of ['reference','hybrid','phase-cards'])$('[data-'+key+']').addEventListener('change',event=>{state[key]=event.target.checked;persist();render();});
 $('[data-reload]').addEventListener('click',async()=>{
     try { const response=await fetch('/api/groups/reload',{method:'POST',headers:{'X-P1Scope-Action':'reload'}});if(!response.ok)throw Error('Reload failed');const result=await response.json();$('[data-error]').textContent=result.ok?'Groups reloaded':result.error;await poll(); }catch(_){$('[data-error]').textContent='Could not reload groups';}
 });
 async function poll(){
-    try { const response=await fetch('/api/state',{cache:'no-store',signal:AbortSignal.timeout(8000)});if(!response.ok)throw Error('HTTP '+response.status);snapshot=await response.json();$('[data-error]').textContent='';render(); }
+    try { const response=await fetch('/api/state?minutes='+state.minutes,{cache:'no-store',signal:AbortSignal.timeout(8000)});if(!response.ok)throw Error('HTTP '+response.status);snapshot=await response.json();$('[data-error]').textContent='';render(); }
     catch(_){$('[data-status]').textContent='DISCONNECTED';$('[data-error]').textContent='Server unreachable. Displayed readings are stale; retrying…';}
     finally{clearTimeout(poll.timer);poll.timer=setTimeout(poll,2000);}
 }
